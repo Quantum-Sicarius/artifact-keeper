@@ -943,8 +943,11 @@ fn push_scope(image_name: &str) -> String {
 // Storage helpers
 // ---------------------------------------------------------------------------
 
+/// Prefix of every final, content-addressed OCI blob key.
+pub(crate) const OCI_BLOB_KEY_PREFIX: &str = "oci-blobs/";
+
 pub(crate) fn blob_storage_key(digest: &str) -> String {
-    format!("oci-blobs/{}", digest)
+    format!("{OCI_BLOB_KEY_PREFIX}{digest}")
 }
 
 /// Storage key for an OCI manifest object: [`OCI_MANIFEST_STORAGE_PREFIX`]
@@ -1285,41 +1288,92 @@ async fn delete_storage_key_best_effort(
 /// no-op write chosen over `DO NOTHING` purely because `DO NOTHING` returns no
 /// row on conflict, and a re-push of a digest whose journal row still exists is
 /// the common case.
+///
+/// Rows are unique per (repository, key) since #3851, so concurrent pushes of
+/// one digest to different repositories each own a row and neither can clear
+/// the other's. The registration runs under the per-key lock shared with the
+/// sweep's tombstone ([`lock_cleanup_journal_key`]) and refuses, retryably,
+/// while another repository's row for the key is tombstoned under a live
+/// claim: that sweep is deleting the object right now, and on a shared-
+/// namespace backend it is the same object this push is about to rely on.
+/// (A tombstoned row in *this* repository is returned as before, and the
+/// commit-time claim reports it.)
+///
+/// [`lock_cleanup_journal_key`]: crate::services::storage_gc_service::lock_cleanup_journal_key
 async fn register_oci_upload_cleanup_key(
     db: &PgPool,
     repository_id: Uuid,
     upload_session_id: Option<Uuid>,
     storage_key: &str,
 ) -> Result<i64, Response> {
-    sqlx::query(
-        r#"
-        INSERT INTO oci_upload_cleanup_keys (repository_id, upload_session_id, storage_key)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (storage_key) DO UPDATE SET storage_key = EXCLUDED.storage_key
-        RETURNING id
-        "#,
-    )
-    .bind(repository_id)
-    .bind(upload_session_id)
-    .bind(storage_key)
-    .fetch_one(db)
+    let registered = async {
+        let mut tx = db.begin().await?;
+        crate::services::storage_gc_service::lock_cleanup_journal_key(&mut tx, storage_key).await?;
+        let reclaiming = sqlx::query(
+            "SELECT 1 AS present FROM oci_upload_cleanup_keys c \
+             WHERE c.storage_key = $1 AND c.repository_id <> $2 \
+               AND c.pending_delete_at IS NOT NULL AND c.claim_expires_at > NOW() \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM repositories r \
+                 WHERE r.id = $2 AND r.storage_backend = 'filesystem') \
+             LIMIT 1",
+        )
+        .bind(storage_key)
+        .bind(repository_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if reclaiming.is_some() {
+            return Ok(None);
+        }
+        let id = sqlx::query(
+            r#"
+            INSERT INTO oci_upload_cleanup_keys (repository_id, upload_session_id, storage_key)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (repository_id, storage_key)
+                DO UPDATE SET last_registered_at = NOW()
+            RETURNING id
+            "#,
+        )
+        .bind(repository_id)
+        .bind(upload_session_id)
+        .bind(storage_key)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get::<i64, _>("id")?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(Some(id))
+    }
     .await
-    .map_err(|e| oci_internal_error(&e.to_string()))?
-    .try_get::<i64, _>("id")
-    .map_err(|e| oci_internal_error(&e.to_string()))
+    .map_err(|e| oci_internal_error(&e.to_string()))?;
+
+    registered.ok_or_else(|| {
+        warn!(
+            storage_key = %storage_key,
+            "OCI upload refused: another repository's cleanup sweep is deleting this key (#3851)"
+        );
+        oci_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BLOB_UPLOAD_INVALID",
+            "blob storage was being reclaimed concurrently; retry the upload",
+        )
+    })
 }
 
 async fn mark_oci_upload_cleanup_key_committed(
     db: &PgPool,
+    repository_id: Uuid,
     storage_key: &str,
 ) -> Result<(), Response> {
+    // Scoped to the pushing repository (#3851): another repository's row for
+    // the same key tracks that repository's own push.
     let result = sqlx::query(
         r#"
         UPDATE oci_upload_cleanup_keys
         SET storage_write_completed_at = COALESCE(storage_write_completed_at, NOW())
-        WHERE storage_key = $1
+        WHERE repository_id = $1 AND storage_key = $2
         "#,
     )
+    .bind(repository_id)
     .bind(storage_key)
     .execute(db)
     .await
@@ -6346,7 +6400,9 @@ async fn handle_start_upload(
             Ok(r) => r,
             Err(resp) => return resp,
         };
-        if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, &temp_key).await {
+        if let Err(resp) =
+            mark_oci_upload_cleanup_key_committed(&state.db, repo_id, &temp_key).await
+        {
             delete_storage_key_best_effort(&storage, &temp_key, "monolithic cleanup mark failed")
                 .await;
             return resp;
@@ -6572,7 +6628,7 @@ async fn handle_start_upload(
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, &temp_key).await {
+    if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, repo_id, &temp_key).await {
         delete_storage_key_best_effort(&storage, &temp_key, "upload session cleanup mark failed")
             .await;
         return resp;
@@ -6786,7 +6842,7 @@ async fn handle_patch_upload(
     // journaled-but-unreferenced, and the sweep will not reclaim it until the
     // TTL elapses — long after a healthy request has either inserted the part
     // row or compensated by deleting the object on an error path.
-    if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, &part_key).await {
+    if let Err(resp) = mark_oci_upload_cleanup_key_committed(&state.db, repo.id, &part_key).await {
         delete_storage_key_best_effort(&storage, &part_key, "PATCH cleanup mark failed").await;
         return resp;
     }
@@ -7421,8 +7477,12 @@ async fn handle_complete_upload(
                 None
             }
             Ok(result) => {
-                if let Err(resp) =
-                    mark_oci_upload_cleanup_key_committed(&state.db, &final_part_key).await
+                if let Err(resp) = mark_oci_upload_cleanup_key_committed(
+                    &state.db,
+                    session.repository_id,
+                    &final_part_key,
+                )
+                .await
                 {
                     delete_storage_key_best_effort(
                         &storage,
@@ -7702,8 +7762,12 @@ async fn handle_complete_upload(
             .await
         {
             Ok(result) => {
-                if let Err(resp) =
-                    mark_oci_upload_cleanup_key_committed(&state.db, &completion_temp_key).await
+                if let Err(resp) = mark_oci_upload_cleanup_key_committed(
+                    &state.db,
+                    session.repository_id,
+                    &completion_temp_key,
+                )
+                .await
                 {
                     delete_storage_key_best_effort(
                         &storage,
@@ -39867,5 +39931,297 @@ mod token_exchange_expiry_cap_3460 {
         );
 
         tdh::cleanup_user(&pool, user_id).await;
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod cleanup_journal_repository_scope_tests {
+    //! #3851: the OCI upload cleanup journal is scoped per (repository, key).
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::storage_gc_service::{
+        claim_cleanup_journal_row_for_blob_commit, CleanupJournalClaim,
+    };
+
+    /// Point a test repository at a (never resolved) cloud-style backend
+    /// name, so its objects count as sharing one namespace with other repos.
+    async fn set_shared_namespace_backend(pool: &PgPool, repo: Uuid) {
+        sqlx::query("UPDATE repositories SET storage_backend = 's3' WHERE id = $1")
+            .bind(repo)
+            .execute(pool)
+            .await
+            .expect("set backend");
+    }
+
+    async fn tombstone_live(pool: &PgPool, journal_id: i64) {
+        sqlx::query(
+            "UPDATE oci_upload_cleanup_keys \
+             SET pending_delete_at = NOW(), claim_token = gen_random_uuid(), \
+                 claim_expires_at = NOW() + INTERVAL '15 minutes' \
+             WHERE id = $1",
+        )
+        .bind(journal_id)
+        .execute(pool)
+        .await
+        .expect("tombstone as a live sweep would");
+    }
+
+    /// Review B2: B registered BEFORE repository A's sweep tombstoned A's row
+    /// for the same object, so registration could not refuse it. B's commit
+    /// must still refuse (the shared object is being deleted) on a shared
+    /// namespace — and must not on a repo-isolated filesystem backend.
+    #[tokio::test]
+    async fn commit_refuses_while_another_repositorys_sweep_deletes_the_shared_object() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _ka, dir_a) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_b, _kb, dir_b) = tdh::create_repo(&pool, "local", "docker").await;
+        let digest = format!("sha256:{}", Uuid::new_v4().simple());
+        let key = blob_storage_key(&digest);
+
+        let journal_a = register_oci_upload_cleanup_key(&pool, repo_a, None, &key)
+            .await
+            .expect("register A");
+        let journal_b = register_oci_upload_cleanup_key(&pool, repo_b, None, &key)
+            .await
+            .expect("register B");
+        tombstone_live(&pool, journal_a).await;
+
+        // Filesystem: B has its own copy; A's sweep cannot touch it.
+        assert_eq!(
+            commit_blob(&pool, journal_b, repo_b, &key, &digest).await,
+            CleanupJournalClaim::Cleared
+        );
+
+        // Shared namespace: same interleaving, B must be refused.
+        set_shared_namespace_backend(&pool, repo_a).await;
+        set_shared_namespace_backend(&pool, repo_b).await;
+        sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1")
+            .bind(repo_b)
+            .execute(&pool)
+            .await
+            .expect("reset B");
+        let journal_b = register_oci_upload_cleanup_key(&pool, repo_b, None, &key).await;
+        // Registration now sees the foreign sweep and refuses outright...
+        assert!(journal_b.is_err(), "registration during a foreign sweep");
+        // ...and a row registered before the tombstone is refused at commit.
+        let journal_b: i64 = sqlx::query_scalar(
+            "INSERT INTO oci_upload_cleanup_keys (repository_id, storage_key) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(repo_b)
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("B's pre-tombstone row");
+        assert_eq!(
+            commit_blob(&pool, journal_b, repo_b, &key, &digest).await,
+            CleanupJournalClaim::Doomed,
+            "B must not commit an oci_blobs row for an object being deleted"
+        );
+
+        for repo in [repo_a, repo_b] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// Re-registering over a lingering row refreshes `last_registered_at`,
+    /// which the sweep's fresh-sibling guard reads (review B2).
+    #[tokio::test]
+    async fn re_registration_refreshes_the_registration_timestamp() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _k, dir) = tdh::create_repo(&pool, "local", "docker").await;
+        let key = blob_storage_key(&format!("sha256:{}", Uuid::new_v4().simple()));
+        let id = register_oci_upload_cleanup_key(&pool, repo, None, &key)
+            .await
+            .expect("register");
+        sqlx::query(
+            "UPDATE oci_upload_cleanup_keys \
+             SET created_at = NOW() - INTERVAL '48 hours', \
+                 last_registered_at = NOW() - INTERVAL '48 hours' WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("age row");
+        let again = register_oci_upload_cleanup_key(&pool, repo, None, &key)
+            .await
+            .expect("re-register");
+        assert_eq!(id, again);
+        let fresh: bool = sqlx::query_scalar(
+            "SELECT last_registered_at > NOW() - INTERVAL '1 hour' \
+             FROM oci_upload_cleanup_keys WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("read");
+        assert!(
+            fresh,
+            "a new push over an aged row must look live to sweeps"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    async fn commit_blob(
+        pool: &PgPool,
+        journal_id: i64,
+        repository_id: Uuid,
+        key: &str,
+        digest: &str,
+    ) -> CleanupJournalClaim {
+        let mut tx = pool.begin().await.expect("begin");
+        let claim =
+            claim_cleanup_journal_row_for_blob_commit(&mut tx, journal_id, repository_id, key)
+                .await
+                .expect("claim");
+        if claim == CleanupJournalClaim::Cleared {
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, 1, $3)",
+            )
+            .bind(repository_id)
+            .bind(digest)
+            .bind(key)
+            .execute(&mut *tx)
+            .await
+            .expect("insert oci_blobs");
+        }
+        tx.commit().await.expect("commit");
+        claim
+    }
+
+    /// The race from the issue: two concurrent pushes of one digest to two
+    /// repositories, the first commits, and its repository is deleted before
+    /// the second commits. Under the global `UNIQUE(storage_key)` both pushes
+    /// shared one journal row; the winner deleted it, the repository deletion
+    /// took the winner's `oci_blobs` proof row with it, and the second push
+    /// was refused with `503 BLOB_UPLOAD_INVALID` although its upload was
+    /// valid. Each push now owns its own row.
+    #[tokio::test]
+    async fn concurrent_cross_repo_pushes_of_one_digest_both_commit_when_one_repo_is_deleted() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _key_a, dir_a) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_b, _key_b, dir_b) = tdh::create_repo(&pool, "local", "docker").await;
+        let digest = format!(
+            "sha256:{}",
+            hex::encode(Uuid::new_v4().as_bytes()).repeat(2)
+        );
+        let key = blob_storage_key(&digest);
+
+        let journal_a = register_oci_upload_cleanup_key(&pool, repo_a, None, &key)
+            .await
+            .expect("register A");
+        let journal_b = register_oci_upload_cleanup_key(&pool, repo_b, None, &key)
+            .await
+            .expect("register B");
+        assert_ne!(
+            journal_a, journal_b,
+            "concurrent pushes to different repositories must not share a journal row"
+        );
+
+        assert_eq!(
+            commit_blob(&pool, journal_a, repo_a, &key, &digest).await,
+            CleanupJournalClaim::Cleared
+        );
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_a)
+            .execute(&pool)
+            .await
+            .expect("delete the winner's repository");
+
+        assert_eq!(
+            commit_blob(&pool, journal_b, repo_b, &key, &digest).await,
+            CleanupJournalClaim::Cleared,
+            "the second push was valid and must commit"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_b)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// Same-repository pushes still share one row (the dedup the journal
+    /// protects), and a registration while ANOTHER repository's row for the
+    /// key is tombstoned under a live sweep claim is refused retryably: that
+    /// sweep is deleting the object, which a shared-namespace backend would
+    /// also serve to this push.
+    #[tokio::test]
+    async fn registration_dedups_per_repository_and_refuses_during_a_foreign_sweep() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_a, _key_a, dir_a) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_b, _key_b, dir_b) = tdh::create_repo(&pool, "local", "docker").await;
+        for repo in [repo_a, repo_b] {
+            set_shared_namespace_backend(&pool, repo).await;
+        }
+        let key = blob_storage_key(&format!("sha256:{}", Uuid::new_v4().simple()));
+
+        let first = register_oci_upload_cleanup_key(&pool, repo_a, None, &key)
+            .await
+            .expect("register A");
+        let again = register_oci_upload_cleanup_key(&pool, repo_a, None, &key)
+            .await
+            .expect("re-register A");
+        assert_eq!(first, again, "same repository, same key: one row");
+
+        sqlx::query(
+            "UPDATE oci_upload_cleanup_keys \
+             SET pending_delete_at = NOW(), claim_token = gen_random_uuid(), \
+                 claim_expires_at = NOW() + INTERVAL '15 minutes' \
+             WHERE id = $1",
+        )
+        .bind(first)
+        .execute(&pool)
+        .await
+        .expect("tombstone A's row as a live sweep would");
+
+        let refused = register_oci_upload_cleanup_key(&pool, repo_b, None, &key)
+            .await
+            .expect_err("a foreign live tombstone must refuse the registration");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // A lapsed claim (crashed sweep) is not binding.
+        sqlx::query(
+            "UPDATE oci_upload_cleanup_keys SET claim_expires_at = NOW() - INTERVAL '1 minute' \
+             WHERE id = $1",
+        )
+        .bind(first)
+        .execute(&pool)
+        .await
+        .expect("lapse the claim");
+        let b = register_oci_upload_cleanup_key(&pool, repo_b, None, &key)
+            .await
+            .expect("register B after the claim lapsed");
+        assert_ne!(b, first);
+
+        for repo in [repo_a, repo_b] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
     }
 }
