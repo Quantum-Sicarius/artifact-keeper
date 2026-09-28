@@ -659,6 +659,48 @@ async fn complete_session_commit(
             .map_err(map_upload_err)?;
     let temp_path = assembled.path();
 
+    // #2588: packages pushed through the generic chunked flow must still
+    // surface format metadata (the native format routes parse it at upload
+    // time). Parse a bounded prefix of the uploaded file *before* the bytes
+    // are stored, so a header the server refuses to index (over rpm's limits
+    // or carrying XML-forbidden control characters, #3801) is rejected with
+    // 400 instead of leaving an object behind. The parse runs on the
+    // blocking pool: it is linear but proportional to an untrusted header.
+    // Replication sessions carry the source row's metadata instead, so
+    // nothing is read for them.
+    // Only a TRUSTED replication session (admin or service account) may
+    // bring its own metadata instead: the replication header is client-set.
+    let replication_trusted = super::repositories::replication_exemption_trusted(
+        is_replication_request || session.is_replication,
+        auth.is_admin,
+        auth.is_service_account,
+    );
+    let rpm_upload_metadata = if !(replication_trusted
+        && session.artifact_metadata_format.is_some())
+        && rpm_header_metadata_eligible(&repo.format, &session.artifact_path)
+    {
+        match read_rpm_header_prefix(temp_path).await {
+            Ok(prefix) => {
+                let filename = artifact_name_from_path(&session.artifact_path).to_string();
+                match tokio::task::spawn_blocking(move || {
+                    super::rpm::build_rpm_artifact_metadata(&filename, &prefix)
+                })
+                .await
+                {
+                    Ok(Ok(metadata)) => metadata,
+                    Ok(Err(rejected)) => {
+                        UploadService::fail_committing(&state.db, &session, &rejected.0).await;
+                        return Err(map_err(StatusCode::BAD_REQUEST, rejected.0));
+                    }
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     // The key is content-addressed and every backend writes it atomically, so
     // an object already present under it is the object we would write and can
     // be reused instead of rewritten -- the same dedup the two direct upload
@@ -691,22 +733,6 @@ async fn complete_session_commit(
             return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
     }
-
-    // #2588: packages pushed through the generic chunked flow must still
-    // surface format metadata (the native format routes parse it at upload
-    // time). Capture a bounded prefix of the uploaded file *before* the temp
-    // copy is deleted so the format header can be parsed once the artifact
-    // row exists. Replication sessions carry the source row's metadata
-    // instead, so nothing is read for them.
-    let format_header_prefix = if session.artifact_metadata_format.is_none()
-        && rpm_header_metadata_eligible(&repo.format, &session.artifact_path)
-    {
-        read_file_prefix(temp_path, FORMAT_HEADER_PREFIX_LIMIT)
-            .await
-            .ok()
-    } else {
-        None
-    };
 
     // Clean up the scratch copy now that the bytes are in final storage.
     drop(assembled);
@@ -823,10 +849,27 @@ async fn complete_session_commit(
         return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
     }
 
-    if let (Some(format), Some(metadata)) = (
+    if let (Some(format), Some(mut metadata)) = (
         session.artifact_metadata_format.as_deref(),
         session.artifact_metadata.clone(),
     ) {
+        // #3801: a repodata block renders verbatim and bypasses every header
+        // budget, so one supplied by an UNTRUSTED client is dropped; the
+        // block parsed from the uploaded bytes above (if any) replaces it,
+        // and otherwise the repodata heal derives it from the stored object.
+        if !replication_trusted
+            && rpm_header_metadata_eligible(&repo.format, &session.artifact_path)
+        {
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.remove(super::rpm::RPM_REPODATA_KEY);
+                if let Some(block) = rpm_upload_metadata
+                    .as_ref()
+                    .and_then(|m| m.get(super::rpm::RPM_REPODATA_KEY))
+                {
+                    obj.insert(super::rpm::RPM_REPODATA_KEY.to_string(), block.clone());
+                }
+            }
+        }
         let properties = session
             .artifact_metadata_properties
             .clone()
@@ -844,21 +887,16 @@ async fn complete_session_commit(
             .await;
             return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
-    } else if let Some(prefix) = &format_header_prefix {
-        // #2588: extract RPM header metadata for generically-pushed packages,
-        // mirroring what the native RPM upload route records. Best-effort:
-        // unparseable or non-package objects simply record no metadata, they
-        // never fail the upload.
-        let filename = artifact_name_from_path(&session.artifact_path);
-        if let Some(metadata) = super::rpm::build_rpm_artifact_metadata(filename, prefix) {
-            crate::api::handlers::proxy_helpers::record_artifact_metadata(
-                &state.db,
-                artifact_id,
-                session.repository_id,
-                "rpm",
-                &metadata,
-            )
-            .await;
+    } else if let Some(metadata) = &rpm_upload_metadata {
+        // #2588: record the RPM header metadata parsed above, mirroring what
+        // the native RPM upload route records. Unparseable or non-package
+        // objects simply record no metadata; they never fail the upload. A
+        // value too large to store is recorded with an unparseable marker.
+        if let Err(e) =
+            super::rpm::record_rpm_metadata(&state.db, artifact_id, session.repository_id, metadata)
+                .await
+        {
+            tracing::warn!(artifact_id = %artifact_id, error = %e, "RPM metadata could not be recorded");
         }
     }
 
@@ -1129,17 +1167,36 @@ fn reject_session_if_promotion_only(promotion_only: bool, is_admin: bool) -> Opt
 }
 
 /// Extract a simple artifact name from its path (last path component without extension).
-/// Upper bound on how much of a completed upload is read back for format
-/// header parsing (#2588). RPM signature+main headers live at the front of
-/// the file and are far smaller than this in practice; anything whose header
-/// does not fit simply records no metadata.
-const FORMAT_HEADER_PREFIX_LIMIT: u64 = 16 * 1024 * 1024;
+/// Read the leading bytes of an uploaded `.rpm` that hold its lead,
+/// signature header and main header (#2588): a 64 KiB read grown to the
+/// size the headers declare, never past what a within-limits package can
+/// need ([`crate::formats::rpm::RPM_HEADER_READ_MAX`]). Reading the whole
+/// header lets every over-limit case be answered with 400 at upload (#3801)
+/// rather than being discovered later by the repodata heal.
+pub(crate) async fn read_rpm_header_prefix(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let mut prefix = read_file_prefix(path, 64 * 1024).await?;
+    for _ in 0..3 {
+        match crate::formats::rpm::RpmHandler::header_bytes_needed(&prefix) {
+            Some(needed)
+                if needed > prefix.len() && needed <= crate::formats::rpm::RPM_HEADER_READ_MAX =>
+            {
+                let grown = read_file_prefix(path, needed as u64).await?;
+                if grown.len() <= prefix.len() {
+                    break; // the file ends inside the header
+                }
+                prefix = grown;
+            }
+            _ => break,
+        }
+    }
+    Ok(prefix)
+}
 
 /// Whether a completed generic upload should get RPM header metadata
 /// extracted (#2588): the target repo is RPM-format and the object is an
 /// actual `.rpm` package. Companion objects (checksum sidecars, `.repo`
 /// snippets, `.drpm` deltas) are left alone.
-fn rpm_header_metadata_eligible(
+pub(crate) fn rpm_header_metadata_eligible(
     format: &crate::models::repository::RepositoryFormat,
     artifact_path: &str,
 ) -> bool {
@@ -3631,6 +3688,176 @@ mod tests {
         cleanup_created_session(&f.pool, &body).await;
         delete_repo_permissions(&f.pool, f.repo_id).await;
         f.teardown().await;
+    }
+
+    /// An `.rpm` whose header the server refuses to index: 3,300 files all
+    /// naming one 20 KB dirname (a ~40 KB header expanding to ~64 MiB).
+    fn over_limit_rpm() -> Vec<u8> {
+        {
+            let files = 3_300u32;
+            let mut store = Vec::new();
+            for _ in 0..files {
+                store.extend_from_slice(b"a\0");
+            }
+            let dir_off = store.len() as u32;
+            store.extend_from_slice(b"/usr/bin/");
+            store.extend(std::iter::repeat_n(b'd', 20 * 1024));
+            store.push(0);
+            let idx_off = store.len() as u32;
+            store.extend(std::iter::repeat_n(0u8, files as usize * 4));
+            let entries: [(u32, u32, u32, u32); 3] = [
+                (1117, 8, 0, files),       // BASENAMES
+                (1118, 8, dir_off, 1),     // DIRNAMES
+                (1116, 4, idx_off, files), // DIRINDEXES
+            ];
+            let mut p = vec![0u8; 96];
+            p[..4].copy_from_slice(&[0xed, 0xab, 0xee, 0xdb]);
+            p[4] = 3;
+            p.extend_from_slice(&[0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            p.extend_from_slice(&[0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0]);
+            p.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            p.extend_from_slice(&(store.len() as u32).to_be_bytes());
+            for (tag, ty, off, count) in entries {
+                for v in [tag, ty, off, count] {
+                    p.extend_from_slice(&v.to_be_bytes());
+                }
+            }
+            p.extend_from_slice(&store);
+            p
+        }
+    }
+
+    /// Drive create (optionally as a replication session carrying its own
+    /// metadata), one chunk and complete for `payload`; returns the
+    /// completion status/body, whether the content key exists afterwards and
+    /// the repository's artifact row count.
+    async fn chunked_rpm_upload(
+        f: &tdh::Fixture,
+        payload: &[u8],
+        path: &str,
+        replication_metadata: Option<serde_json::Value>,
+    ) -> (StatusCode, bytes::Bytes, bool, i64) {
+        use sha2::{Digest, Sha256};
+        let checksum = hex::encode(Sha256::digest(payload));
+        let mut body = serde_json::json!({
+            "repository_key": f.repo_key,
+            "artifact_path": path,
+            "total_size": payload.len() as i64,
+            "checksum_sha256": checksum,
+            "chunk_size": 1024 * 1024_i64,
+        });
+        let req = match &replication_metadata {
+            Some(metadata) => {
+                body["artifact_metadata_format"] = serde_json::json!("rpm");
+                body["artifact_metadata"] = metadata.clone();
+                create_replication_session_req(&body)
+            }
+            None => create_session_req(&body),
+        };
+        let app = upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let (status, resp) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
+        let session_id: Uuid = serde_json::from_value(
+            serde_json::from_slice::<serde_json::Value>(&resp).unwrap()["session_id"].clone(),
+        )
+        .unwrap();
+
+        let app = upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}", session_id))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
+            )
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(payload.to_vec()))
+            .unwrap();
+        let (status, resp) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+
+        let app = upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let mut req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/complete", session_id))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        if replication_metadata.is_some() {
+            req.headers_mut().insert(
+                "x-artifact-keeper-replication",
+                axum::http::HeaderValue::from_static("true"),
+            );
+        }
+        let (status, resp) = tdh::send(app, req).await;
+        let key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+            &checksum,
+        );
+        let stored = f.storage_dir.join(&key).exists();
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        (status, resp, stored, rows)
+    }
+
+    /// #3801: an over-limit `.rpm` is rejected with 400 at chunked
+    /// completion, BEFORE the reassembled bytes are stored: no object at the
+    /// content key, no artifact row.
+    #[tokio::test]
+    async fn complete_rejects_over_limit_rpm_before_storing() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let (status, body, stored, rows) =
+            chunked_rpm_upload(&f, &over_limit_rpm(), "hostile-1.0-1.noarch.rpm", None).await;
+        f.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "over-limit RPM must be refused: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(!stored, "nothing may be stored for a refused RPM");
+        assert_eq!(rows, 0, "no artifact row for a refused RPM");
+    }
+
+    /// A plain writer (not admin, not a service account) cannot skip the
+    /// parse by sending the client-set replication header with its own
+    /// metadata — including a forged repodata block, which would otherwise
+    /// render verbatim past every budget.
+    #[tokio::test]
+    async fn complete_parses_untrusted_replication_sessions() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let forged = serde_json::json!({
+            "name": "hostile",
+            "repodata": {"v": 1, "header_start": 0, "header_end": 0,
+                         "provides": [{"name": "forged"}]},
+        });
+        let (status, body, stored, rows) = chunked_rpm_upload(
+            &f,
+            &over_limit_rpm(),
+            "hostile-1.0-1.noarch.rpm",
+            Some(forged),
+        )
+        .await;
+        f.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an untrusted replication session is still parsed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(!stored);
+        assert_eq!(rows, 0);
     }
 
     #[tokio::test]
