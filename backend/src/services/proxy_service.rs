@@ -821,6 +821,22 @@ fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether `err` is the error [`validate_upstream_status`] produces for an
+/// upstream `403 Forbidden`.
+///
+/// Ordinary fetches keep surfacing that as 502. The one caller is PyPI's PEP
+/// 658 sidecar fetch (#3886): object stores behind CloudFront (PyTorch's
+/// `download.pytorch.org`) answer a missing key with 403 rather than 404, so
+/// for an OPTIONAL derived resource that has a local recovery (extract METADATA
+/// from the wheel) the 403 means "not here", exactly like 404.
+pub(crate) fn is_upstream_forbidden(err: &AppError) -> bool {
+    matches!(
+        err,
+        AppError::BadGateway(msg)
+            if msg.starts_with(&format!("Upstream returned error status {}", StatusCode::FORBIDDEN))
+    )
+}
+
 /// Whether a single path segment is a dot segment, in the same sense the WHATWG
 /// URL parser uses when it normalizes a path.
 ///
@@ -13304,6 +13320,32 @@ mod tests {
             redact_url_for_diagnostics("packages/pkg.zip"),
             "packages/pkg.zip"
         );
+    }
+
+    /// `is_upstream_forbidden` recognises 403 by the message
+    /// `validate_upstream_status` writes (AppError carries no status code, and
+    /// adding a variant would touch every exhaustive match on it). Pin the
+    /// pair against the PRODUCER, not a hand-written string, so a rewording of
+    /// that message fails here instead of silently turning PyPI's #3886 403
+    /// sidecar fallback back into a 502.
+    #[test]
+    fn test_is_upstream_forbidden_tracks_validate_upstream_status_3886() {
+        let err = |s: StatusCode| {
+            validate_upstream_status(s, "https://up.example/x").expect_err("non-2xx must fail")
+        };
+        assert!(is_upstream_forbidden(&err(StatusCode::FORBIDDEN)));
+        for other in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+            StatusCode::GONE,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(
+                !is_upstream_forbidden(&err(other)),
+                "{other} must not be classified as an upstream 403"
+            );
+        }
     }
 
     #[test]
