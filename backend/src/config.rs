@@ -952,6 +952,25 @@ pub struct Config {
     /// `presigned_downloads_enabled` is true. Default: 300 (5 minutes).
     pub presigned_download_expiry_secs: u64,
 
+    /// Verify a stored artifact's bytes against its recorded SHA-256 while the
+    /// generic download route streams them (#3919). The digest is computed
+    /// incrementally (one chunk held back, no buffering); on a mismatch the
+    /// response is aborted before the final bytes, so a corrupted object is
+    /// never delivered in full under the original `X-Checksum-Sha256`.
+    /// Default: true. Set `DOWNLOAD_VERIFY_CHECKSUMS=false` to skip the
+    /// per-download hash (integrity is then the client's responsibility).
+    pub download_verify_checksums: bool,
+
+    /// Interval between scheduled storage scrub passes (#3910), in seconds.
+    /// `0` (default) disables the scheduled scrub; the admin endpoint
+    /// `POST /api/v1/admin/storage-scrub` works either way. Each pass is
+    /// report-only and bounded by the two budgets below.
+    pub storage_scrub_interval_secs: u64,
+    /// Objects checked per scrub pass (default 500).
+    pub storage_scrub_max_objects: u64,
+    /// Bytes read per scrub pass (default 2 GiB).
+    pub storage_scrub_max_bytes: u64,
+
     // -- Proxy pull-through cache cross-replica single-flight (#1609) --
     /// Enable the cross-replica single-flight coordinator for pull-through cache
     /// fills: a PostgreSQL advisory lock keyed on the cache key so exactly ONE
@@ -1187,6 +1206,10 @@ redacted_debug!(Config {
     show password_min_strength,
     show presigned_downloads_enabled,
     show presigned_download_expiry_secs,
+    show download_verify_checksums,
+    show storage_scrub_interval_secs,
+    show storage_scrub_max_objects,
+    show storage_scrub_max_bytes,
     show proxy_singleflight_advisory_locks_enabled,
     show proxy_singleflight_lock_poll_interval_ms,
     show proxy_singleflight_lock_wait_timeout_secs,
@@ -1321,6 +1344,10 @@ impl Default for Config {
             password_min_strength: 0,
             presigned_downloads_enabled: false,
             presigned_download_expiry_secs: 300,
+            download_verify_checksums: true,
+            storage_scrub_interval_secs: 0,
+            storage_scrub_max_objects: 500,
+            storage_scrub_max_bytes: 2 << 30,
             proxy_singleflight_advisory_locks_enabled: false,
             proxy_singleflight_lock_poll_interval_ms: 200,
             proxy_singleflight_lock_wait_timeout_secs: 65,
@@ -1429,6 +1456,9 @@ impl Config {
                 env::var("AK_GUEST_ACCESS_ENABLED").as_deref(),
                 Ok("false" | "0")
             ),
+            storage_scrub_interval_secs: env_parse("STORAGE_SCRUB_INTERVAL_SECS", 0),
+            storage_scrub_max_objects: env_parse("STORAGE_SCRUB_MAX_OBJECTS", 500),
+            storage_scrub_max_bytes: env_parse("STORAGE_SCRUB_MAX_BYTES", 2 << 30),
             // Info-disclosure hardening (#2226): the public /health response
             // hides the git commit SHA and live db-pool internals unless an
             // operator explicitly opts in. Default OFF; only "true"/"1" enables.
@@ -1681,6 +1711,10 @@ impl Config {
                 Ok("true" | "1")
             ),
             presigned_download_expiry_secs: env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300),
+            download_verify_checksums: !matches!(
+                env::var("DOWNLOAD_VERIFY_CHECKSUMS").as_deref(),
+                Ok("false" | "0")
+            ),
             proxy_singleflight_advisory_locks_enabled: matches!(
                 env::var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED").as_deref(),
                 Ok("true" | "1")
