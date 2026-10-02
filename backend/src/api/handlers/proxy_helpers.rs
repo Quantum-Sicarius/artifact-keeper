@@ -18214,6 +18214,60 @@ mod tests {
         );
     }
 
+    /// #3813 follow-up: an ANONYMOUS caller of a PUBLIC virtual must not
+    /// reach an `internal` member through it. `internal` is the
+    /// authenticated baseline; a public parent must not launder it down to
+    /// anonymous. A public member is the positive control.
+    #[tokio::test]
+    async fn anonymous_caller_of_public_virtual_cannot_read_internal_member() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (virtual_id, _vk, virtual_dir) =
+            db_helpers::create_repo(&pool, "virtual", "generic").await;
+        let (internal_id, _ik, internal_dir) =
+            db_helpers::create_repo(&pool, "local", "generic").await;
+        let (public_id, _pk, public_dir) = db_helpers::create_repo(&pool, "local", "generic").await;
+        for (id, visibility) in [
+            (virtual_id, "public"),
+            (internal_id, "internal"),
+            (public_id, "public"),
+        ] {
+            sqlx::query(
+                "UPDATE repositories SET visibility = $2::repository_visibility WHERE id = $1",
+            )
+            .bind(id)
+            .bind(visibility)
+            .execute(&pool)
+            .await
+            .expect("set visibility");
+        }
+        let svc = crate::services::repository_service::RepositoryService::new(pool.clone());
+        let internal = svc.get_by_id(internal_id).await.expect("load internal");
+        let public = svc.get_by_id(public_id).await.expect("load public");
+
+        let anon_internal = caller_can_read_member(&pool, None, virtual_id, &internal).await;
+        let anon_public = caller_can_read_member(&pool, None, virtual_id, &public).await;
+
+        for (id, dir) in [
+            (virtual_id, virtual_dir),
+            (internal_id, internal_dir),
+            (public_id, public_dir),
+        ] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert!(
+            !anon_internal,
+            "an anonymous caller of a public virtual must not read an internal member"
+        );
+        assert!(anon_public, "control: a public member stays readable");
+    }
+
     #[test]
     fn age_gate_params_maps_remote_npm_repo() {
         let info = RepoInfo {
@@ -19317,9 +19371,12 @@ mod virtual_read_authz_tests {
     ///   within [`AUTHZ_WINDOW`] bytes (the content-serving shape — most sites
     ///   now call [`authorized_virtual_members`], which is the pair fused into
     ///   one call and matches this substring too); or
-    /// * preceded by an explicit `UNFILTERED-ENFORCEMENT` or
-    ///   `UNFILTERED-DEFERRED` marker, which forces the author to state in the
-    ///   source WHY this walk must not be narrowed.
+    /// * preceded by an explicit `UNFILTERED-ENFORCEMENT` marker, which forces
+    ///   the author to state in the source WHY this walk must not be narrowed.
+    ///
+    /// The deferral escape is gone: its only user, the RPM virtual repodata
+    /// walk, is caller-authorized since #4346, so a content-serving walk can no
+    /// longer be parked as "fix later".
     ///
     /// The marker exists because filtering is not universally correct: a walk
     /// that computes a DENY-set (OCI's scan-verdict blocklist) or a shadowing
@@ -19360,9 +19417,7 @@ mod virtual_read_authz_tests {
                 // multi-byte characters (em dashes in the comments), and slicing
                 // mid-codepoint would panic.
                 let before = &src[floor_boundary(src, at.saturating_sub(MARKER_WINDOW))..at];
-                if before.contains("UNFILTERED-ENFORCEMENT")
-                    || before.contains("UNFILTERED-DEFERRED")
-                {
+                if before.contains("UNFILTERED-ENFORCEMENT") {
                     continue;
                 }
 
@@ -19380,11 +19435,28 @@ mod virtual_read_authz_tests {
         assert!(
             unguarded.is_empty(),
             "#3323: these virtual-repo member walks neither authorize the member set \
-             against the caller nor carry an UNFILTERED-ENFORCEMENT / \
-             UNFILTERED-DEFERRED marker explaining why they must not: {unguarded:?}. \
+             against the caller nor carry an UNFILTERED-ENFORCEMENT marker \
+             explaining why they must not: {unguarded:?}. \
              A content-serving path must use `proxy_helpers::authorized_virtual_members`; \
              an enforcement path (deny-set, shadowing guard, cache invalidation) must \
              say so in a comment immediately above the call."
+        );
+    }
+
+    /// #4346: no content-serving member walk is parked behind a deferral
+    /// marker any more. The RPM repodata walk was the last one (#3323); a new
+    /// deferral marker would reopen the class, so the count is pinned at zero.
+    #[test]
+    fn no_virtual_member_walk_is_deferred_4346() {
+        let deferred: Vec<&str> = HANDLER_SOURCES
+            .iter()
+            .filter(|(_, src)| src.contains(concat!("UNFILTERED", "-DEFERRED")))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            deferred.is_empty(),
+            "#4346: content-serving virtual member walks must be caller-authorized, \
+             not deferred: {deferred:?}"
         );
     }
 
