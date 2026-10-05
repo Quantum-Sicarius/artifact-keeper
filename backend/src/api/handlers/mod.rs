@@ -316,6 +316,7 @@ pub mod auth;
 pub mod banners;
 pub mod bazel;
 pub mod builds;
+pub mod bundles;
 pub mod cache_headers;
 pub mod cargo;
 pub mod chef;

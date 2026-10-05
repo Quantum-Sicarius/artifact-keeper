@@ -763,6 +763,17 @@ impl ScanResultService {
     /// the orchestrator writes it provisionally while a scan set is still
     /// running, so it is not a verdict another artifact can inherit; the
     /// requester runs its own scan instead.
+    ///
+    /// #2464: only `origin = 'local_scan'` rows are reused. `scan_results` is
+    /// keyed by content hash, not by artifact lifecycle, so a row whose
+    /// verdict did not come from this instance's own scanner (scan evidence
+    /// carried in an imported bundle) would otherwise become a permanent,
+    /// instance-wide scan exemption for every future upload of those bytes.
+    /// Imported evidence lives in `bundle_scan_evidence`; this filter holds
+    /// even if a later change routes it here. The per-artifact short-circuits
+    /// ([`Self::find_existing_scan_for_artifact`] and step 1 of
+    /// [`Self::prepare_scan_placeholder`]) apply the same filter, so an
+    /// imported row can never stand in for an artifact's own local scan.
     pub async fn find_reusable_scan(
         &self,
         checksum_sha256: &str,
@@ -784,6 +795,7 @@ impl ScanResultService {
               AND scan_type = $2
               AND status = 'completed'
               AND scan_completeness <> 'not_cataloged'
+              AND origin = 'local_scan'
               AND pin_identity IS NOT DISTINCT FROM $5
               AND completed_at > NOW() - (
                   CASE WHEN findings_count = 0 THEN $4 ELSE $3 END || ' days'
@@ -842,6 +854,7 @@ impl ScanResultService {
               AND checksum_sha256 = $2
               AND scan_type = $3
               AND status = 'completed'
+              AND origin = 'local_scan'
               AND completed_at > NOW() - (
                   CASE WHEN findings_count = 0 THEN $5 ELSE $4 END || ' days'
               )::interval
@@ -935,6 +948,7 @@ impl ScanResultService {
               AND checksum_sha256 = $2
               AND scan_type = $3
               AND status = 'completed'
+              AND origin = 'local_scan'
               AND completed_at > NOW() - (
                   CASE WHEN findings_count = 0 THEN $5 ELSE $4 END || ' days'
               )::interval
@@ -3832,6 +3846,73 @@ mod tests {
                 pinned_req.is_none(),
                 "a pinned request must not be served an unpinned (byte-only) verdict"
             );
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #2464 (adversarial constraint 1): a completed row whose verdict did
+        /// not come from this instance's scanner (`origin = 'imported'`) must
+        /// never be a dedup source, or a bundle-scoped trust decision becomes
+        /// an instance-wide scan exemption for every future upload of the
+        /// same bytes. The same row as `local_scan` is reused.
+        #[tokio::test]
+        async fn find_reusable_scan_never_reuses_an_imported_verdict() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, ck) = insert_test_artifact(&pool, repo_id, "imported").await;
+            let scan_id = seed_completed_scan_with_pin(&svc, aid, repo_id, &ck, None).await;
+
+            let origin: String =
+                sqlx::query_scalar("SELECT origin FROM scan_results WHERE id = $1")
+                    .bind(scan_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("origin");
+            assert_eq!(origin, "local_scan", "scanner rows default to local_scan");
+            let local = svc
+                .find_reusable_scan(&ck, "grype", 3650, 3650, None)
+                .await
+                .expect("query ok");
+            assert_eq!(local.map(|r| r.id), Some(scan_id));
+
+            sqlx::query("UPDATE scan_results SET origin = 'imported' WHERE id = $1")
+                .bind(scan_id)
+                .execute(&pool)
+                .await
+                .expect("mark imported");
+            let imported = svc
+                .find_reusable_scan(&ck, "grype", 3650, 3650, None)
+                .await
+                .expect("query ok");
+            assert!(
+                imported.is_none(),
+                "an imported verdict must never satisfy hash-based scan dedup"
+            );
+            let own = svc
+                .find_existing_scan_for_artifact(aid, &ck, "grype", 3650, 3650)
+                .await
+                .expect("query ok");
+            assert!(
+                own.is_none(),
+                "an imported row must not short-circuit the artifact's own scan"
+            );
+            let (placeholder, _) = svc
+                .prepare_scan_placeholder(aid, repo_id, &ck, "grype", 3650, 3650)
+                .await
+                .expect("prepare");
+            assert_ne!(
+                placeholder, scan_id,
+                "prepare must queue a local scan rather than reuse the imported row"
+            );
+
+            let bogus = sqlx::query("UPDATE scan_results SET origin = 'bundle' WHERE id = $1")
+                .bind(scan_id)
+                .execute(&pool)
+                .await;
+            assert!(bogus.is_err(), "origin is constrained to known values");
 
             cleanup_repo(&pool, repo_id).await;
         }
