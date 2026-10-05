@@ -51,6 +51,7 @@ use crate::error::{AppError, Result};
 use crate::services::cluster_lock::{lease_object_id, ClusterLock, PgAdvisoryLock};
 use crate::services::cluster_work::WorkerIdentity;
 use crate::services::npm_packument_cache::{self, NpmPackumentCache};
+use crate::services::upstream_tracing::send_upstream;
 
 /// Advisory-lock class for upstream-feed consumers. Distinct from
 /// `PROXY_HYDRATION_LOCK_CLASS` (0x1609) and the scheduler locks
@@ -434,7 +435,7 @@ impl UpstreamFeedAdapter for NpmReplicationFeedAdapter {
     /// genesis (replaying the registry's entire change history).
     async fn bootstrap_cursor(&self) -> Result<Option<String>> {
         let root = feed_root_url(&self.url)?;
-        let response = self.http.get(root).send().await.map_err(|e| {
+        let response = send_upstream(self.http.get(root)).await.map_err(|e| {
             AppError::Internal(format!(
                 "npm feed bootstrap request failed: {}",
                 e.without_url()
@@ -468,7 +469,7 @@ impl UpstreamFeedAdapter for NpmReplicationFeedAdapter {
                 query.append_pair("since", since);
             }
         }
-        let response = self.http.get(url).send().await.map_err(|e| {
+        let response = send_upstream(self.http.get(url)).await.map_err(|e| {
             AppError::Internal(format!("npm feed request failed: {}", e.without_url()))
         })?;
         if !response.status().is_success() {
@@ -1317,12 +1318,15 @@ mod tests {
 
     #[tokio::test]
     async fn npm_adapter_polls_with_since_and_limit_only() {
-        use wiremock::matchers::{method, path, query_param};
+        use wiremock::matchers::{header_exists, method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        // The poll goes through `send_upstream` (#4455).
+        let _otel = crate::testing::otel::trace_upstream_sends();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/_changes"))
+            .and(header_exists("traceparent"))
             .and(query_param("since", "41"))
             .and(query_param("limit", NPM_FEED_BATCH_LIMIT.to_string()))
             .respond_with(ResponseTemplate::new(200).set_body_json(changes_body(
@@ -1549,13 +1553,16 @@ mod tests {
 
     #[tokio::test]
     async fn npm_adapter_bootstraps_head_from_root_update_seq() {
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{header_exists, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        // The bootstrap goes through `send_upstream` (#4455).
+        let _otel = crate::testing::otel::trace_upstream_sends();
         // The real root shape, update_seq as a number.
         let numeric = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/"))
+            .and(header_exists("traceparent"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "db_name": "registry",
                 "engine": "npm-replicate",
