@@ -896,6 +896,30 @@ async fn complete_session_commit(
         }
     }
 
+    // #2382: summarise a `.safetensors` header into `artifact_metadata` from
+    // the stored object (two ranged reads, never the tensor data), as the
+    // direct upload path does in `finalize_upload`. A TRUSTED replication
+    // session's own metadata (written above) is the source row's and wins.
+    // For any other session this intentionally REPLACES whatever document
+    // the client supplied (written above by `set_metadata`) with
+    // server-derived data -- the summary or a `safetensors_error` marker,
+    // never a merge -- so a client cannot plant a forged `safetensors`
+    // block, mirroring how #3801 drops an untrusted client's repodata.
+    if safetensors_extraction_applies(
+        &repo.format,
+        &session.artifact_path,
+        replication_trusted && session.artifact_metadata_format.is_some(),
+    ) {
+        crate::services::artifact_service::record_safetensors_metadata(
+            &state.db,
+            storage.as_ref(),
+            artifact_id,
+            &storage_key,
+            session.total_size,
+        )
+        .await;
+    }
+
     if let Some((package_name, package_version)) =
         completed_package_catalog_entry(&session, &repo.format)
     {
@@ -1205,6 +1229,18 @@ pub(crate) async fn read_rpm_header_prefix(path: &std::path::Path) -> std::io::R
         }
     }
     Ok(prefix)
+}
+
+/// Whether the chunked commit extracts safetensors header metadata (#2382):
+/// an eligible `.safetensors` path in an Mlmodel repository, unless the
+/// session is a trusted replication carrying the source row's metadata.
+fn safetensors_extraction_applies(
+    format: &crate::models::repository::RepositoryFormat,
+    path: &str,
+    trusted_replication_metadata: bool,
+) -> bool {
+    !trusted_replication_metadata
+        && crate::formats::mlmodel::safetensors_metadata_eligible(format, path)
 }
 
 /// Whether a completed generic upload should get RPM header metadata
@@ -3784,15 +3820,22 @@ mod tests {
     }
 
     /// Drive create (optionally as a replication session carrying its own
-    /// metadata), one chunk and complete for `payload`; returns the
+    /// `(format, metadata)`, optionally as an admin, which makes such a
+    /// session trusted), one chunk and complete for `payload`; returns the
     /// completion status/body, whether the content key exists afterwards and
     /// the repository's artifact row count.
-    async fn chunked_rpm_upload(
+    async fn chunked_upload(
         f: &tdh::Fixture,
         payload: &[u8],
         path: &str,
-        replication_metadata: Option<serde_json::Value>,
+        replication_metadata: Option<(&str, serde_json::Value)>,
+        as_admin: bool,
     ) -> (StatusCode, bytes::Bytes, bool, i64) {
+        let auth = || {
+            let mut auth = tdh::make_auth(f.user_id, &f.username);
+            auth.is_admin = as_admin;
+            auth
+        };
         use sha2::{Digest, Sha256};
         let checksum = hex::encode(Sha256::digest(payload));
         let mut body = serde_json::json!({
@@ -3803,14 +3846,14 @@ mod tests {
             "chunk_size": 1024 * 1024_i64,
         });
         let req = match &replication_metadata {
-            Some(metadata) => {
-                body["artifact_metadata_format"] = serde_json::json!("rpm");
+            Some((format, metadata)) => {
+                body["artifact_metadata_format"] = serde_json::json!(format);
                 body["artifact_metadata"] = metadata.clone();
                 create_replication_session_req(&body)
             }
             None => create_session_req(&body),
         };
-        let app = upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let app = upload_router_with_auth(f.state.clone(), auth());
         let (status, resp) = tdh::send(app, req).await;
         assert_eq!(
             status,
@@ -3823,7 +3866,7 @@ mod tests {
         )
         .unwrap();
 
-        let app = upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let app = upload_router_with_auth(f.state.clone(), auth());
         let req = axum::http::Request::builder()
             .method("PATCH")
             .uri(format!("/{}", session_id))
@@ -3837,7 +3880,7 @@ mod tests {
         let (status, resp) = tdh::send(app, req).await;
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
 
-        let app = upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let app = upload_router_with_auth(f.state.clone(), auth());
         let mut req = axum::http::Request::builder()
             .method("PUT")
             .uri(format!("/{}/complete", session_id))
@@ -3871,8 +3914,14 @@ mod tests {
         let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
             return;
         };
-        let (status, body, stored, rows) =
-            chunked_rpm_upload(&f, &over_limit_rpm(), "hostile-1.0-1.noarch.rpm", None).await;
+        let (status, body, stored, rows) = chunked_upload(
+            &f,
+            &over_limit_rpm(),
+            "hostile-1.0-1.noarch.rpm",
+            None,
+            false,
+        )
+        .await;
         f.teardown().await;
         assert_eq!(
             status,
@@ -3898,11 +3947,12 @@ mod tests {
             "repodata": {"v": 1, "header_start": 0, "header_end": 0,
                          "provides": [{"name": "forged"}]},
         });
-        let (status, body, stored, rows) = chunked_rpm_upload(
+        let (status, body, stored, rows) = chunked_upload(
             &f,
             &over_limit_rpm(),
             "hostile-1.0-1.noarch.rpm",
-            Some(forged),
+            Some(("rpm", forged)),
+            false,
         )
         .await;
         f.teardown().await;
@@ -3914,6 +3964,102 @@ mod tests {
         );
         assert!(!stored);
         assert_eq!(rows, 0);
+    }
+
+    /// Complete `.safetensors` bytes into a fresh Mlmodel repo through the
+    /// chunked flow; returns the completion status and the recorded
+    /// `(format, metadata)` row, if any.
+    async fn chunked_safetensors_upload(
+        replication_metadata: Option<(&str, serde_json::Value)>,
+        as_admin: bool,
+    ) -> Option<(StatusCode, Option<(String, serde_json::Value)>)> {
+        let f = tdh::Fixture::setup("local", "mlmodel").await?;
+        let header = serde_json::json!({
+            "w": {"dtype": "BF16", "shape": [3, 5], "data_offsets": [0, 30]}
+        });
+        let payload = crate::formats::mlmodel::safetensors_fixture(&header, 30);
+        let path = "models/tiny/versions/1/artifacts/model.safetensors";
+        let (status, body, _stored, _rows) =
+            chunked_upload(&f, &payload, path, replication_metadata, as_admin).await;
+        let row: Option<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT am.format, am.metadata FROM artifact_metadata am \
+             JOIN artifacts a ON a.id = am.artifact_id \
+             WHERE a.repository_id = $1 AND a.path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(path)
+        .fetch_optional(&f.pool)
+        .await
+        .unwrap();
+        f.teardown().await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        Some((status, row))
+    }
+
+    /// #2382: a `.safetensors` file completed through the chunked flow into
+    /// an Mlmodel repository gets its header summary recorded, exactly as
+    /// the direct upload path does.
+    #[tokio::test]
+    async fn complete_records_safetensors_header_metadata_for_mlmodel() {
+        let Some((_, row)) = chunked_safetensors_upload(None, false).await else {
+            return;
+        };
+        let (format, metadata) = row.expect("safetensors metadata recorded");
+        assert_eq!(format, "mlmodel");
+        assert_eq!(metadata["safetensors"]["total_parameters"], 15);
+        assert_eq!(
+            metadata["safetensors"]["tensors"]["w"]["shape"],
+            serde_json::json!([3, 5])
+        );
+    }
+
+    /// A TRUSTED (admin) replication session carrying the source row's
+    /// metadata keeps it verbatim: no extraction runs over it.
+    #[tokio::test]
+    async fn complete_keeps_trusted_replication_metadata_for_safetensors() {
+        let source = serde_json::json!({"source": "x"});
+        let Some((_, row)) =
+            chunked_safetensors_upload(Some(("mlmodel", source.clone())), true).await
+        else {
+            return;
+        };
+        let (format, metadata) = row.expect("replicated metadata recorded");
+        assert_eq!(format, "mlmodel");
+        assert_eq!(metadata, source, "the source row's metadata wins");
+    }
+
+    /// An UNTRUSTED session's client-supplied document, including a forged
+    /// `safetensors` block, is replaced by the server-derived summary.
+    #[tokio::test]
+    async fn complete_replaces_untrusted_client_metadata_for_safetensors() {
+        let forged = serde_json::json!({"safetensors": {"total_parameters": 1}});
+        let Some((_, row)) = chunked_safetensors_upload(Some(("mlmodel", forged)), false).await
+        else {
+            return;
+        };
+        let (_, metadata) = row.expect("metadata recorded");
+        assert_eq!(metadata["safetensors"]["total_parameters"], 15);
+    }
+
+    #[test]
+    fn safetensors_extraction_skips_trusted_replication_metadata() {
+        use crate::models::repository::RepositoryFormat;
+        let path = "models/m/versions/1/artifacts/model.safetensors";
+        assert!(safetensors_extraction_applies(
+            &RepositoryFormat::Mlmodel,
+            path,
+            false
+        ));
+        assert!(!safetensors_extraction_applies(
+            &RepositoryFormat::Mlmodel,
+            path,
+            true
+        ));
+        assert!(!safetensors_extraction_applies(
+            &RepositoryFormat::Generic,
+            path,
+            false
+        ));
     }
 
     #[tokio::test]
