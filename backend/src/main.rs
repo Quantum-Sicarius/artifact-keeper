@@ -1045,6 +1045,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             db_pool.clone(),
             state.npm_packument_cache.clone(),
             runtime_shutdown_token.clone(),
+            state.upstream_feed_status.clone(),
         );
 
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
