@@ -46,6 +46,11 @@
 //! Unknown keys in `config` are rejected at create/update time rather than
 //! ignored, so a misspelt exclusion fails loudly instead of deleting what it
 //! was written to protect.
+//!
+//! In a Remote repository, `max_age_days` and `no_downloads_days` also evict
+//! proxy-cached content catalogued in `proxy_cache_artifacts` (#3734); see
+//! the `proxy_cache` submodule. Those entries are reported under
+//! `PolicyExecutionResult::proxy_cache`, separately from artifacts.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -815,7 +820,6 @@ pub(crate) struct PolicyExclusions {
 
 impl PolicyExclusions {
     /// True when no exclusion is configured, i.e. the SQL predicate is inert.
-    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.versions.is_empty() && self.version_patterns.is_empty()
     }
@@ -1099,6 +1103,9 @@ pub struct PolicyExecutionResult {
     /// Bytes actually reclaimed by this run. Always zero for a dry run.
     pub bytes_freed: i64,
     pub errors: Vec<String>,
+    /// Proxy-cache entries of Remote repositories in scope (#3734), counted
+    /// separately from the `artifacts_*` / `bytes_*` fields above.
+    pub proxy_cache: ProxyCacheExecutionResult,
 }
 
 /// Aggregate count and bytes for policy matching queries.
@@ -1123,11 +1130,20 @@ struct UsageTotal {
 
 pub struct LifecycleService {
     db: PgPool,
+    /// Owner of the proxy-cache store, for evicting Remote repositories'
+    /// cached objects (#3734). See [`LifecycleService::with_proxy_service`].
+    proxy_service: Option<std::sync::Arc<crate::services::proxy_service::ProxyService>>,
+    /// Candidates per page of a live proxy-cache sweep.
+    proxy_cache_page_size: i64,
 }
 
 impl LifecycleService {
     pub fn new(db: PgPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            proxy_service: None,
+            proxy_cache_page_size: proxy_cache::EVICTION_PAGE_SIZE,
+        }
     }
 
     /// Execute a policy (dry_run=true previews without deleting).
@@ -1164,6 +1180,18 @@ impl LifecycleService {
     /// A crash between tx2 and bookkeeping leaves `last_run_at` stale, so
     /// the policy runs again on the next tick — same idempotent cascade.
     pub async fn execute_policy(&self, id: Uuid, dry_run: bool) -> Result<PolicyExecutionResult> {
+        self.execute_policy_until(id, dry_run, &CancellationToken::new())
+            .await
+    }
+
+    /// [`Self::execute_policy`] that stops a long proxy-cache sweep between
+    /// pages once `abort` fires (the scheduler's lease-loss token, #3502).
+    async fn execute_policy_until(
+        &self,
+        id: Uuid,
+        dry_run: bool,
+        abort: &CancellationToken,
+    ) -> Result<PolicyExecutionResult> {
         let mut policy = self.get_policy(id).await?;
 
         if !policy.enabled && !dry_run {
@@ -1192,13 +1220,17 @@ impl LifecycleService {
             result.artifacts_removed += current.artifacts_removed;
             result.bytes_matched += current.bytes_matched;
             result.bytes_freed += current.bytes_freed;
+            let cache = self
+                .run_proxy_cache_arm(&policy, repository_id, dry_run, abort, &mut result.errors)
+                .await?;
+            result.proxy_cache.absorb(cache);
         }
         if !dry_run {
             sqlx::query(
                 "UPDATE lifecycle_policies SET last_run_at = NOW(), last_run_items_removed = $2 WHERE id = $1",
             )
             .bind(id)
-            .bind(result.artifacts_removed)
+            .bind(result.artifacts_removed + result.proxy_cache.entries_removed)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1317,8 +1349,9 @@ impl LifecycleService {
         &self,
         policy: LifecyclePolicy,
         results: &mut Vec<PolicyExecutionResult>,
+        abort: &CancellationToken,
     ) {
-        match self.execute_policy(policy.id, false).await {
+        match self.execute_policy_until(policy.id, false, abort).await {
             Ok(result) => results.push(result),
             Err(e) => {
                 tracing::error!(
@@ -1335,6 +1368,7 @@ impl LifecycleService {
                     bytes_matched: 0,
                     bytes_freed: 0,
                     errors: vec![e.to_string()],
+                    proxy_cache: ProxyCacheExecutionResult::default(),
                 });
             }
         }
@@ -1345,8 +1379,9 @@ impl LifecycleService {
         let policies = self.load_enabled_policies().await?;
 
         let mut results = Vec::new();
+        let never = CancellationToken::new();
         for policy in policies {
-            self.run_policy_into(policy, &mut results).await;
+            self.run_policy_into(policy, &mut results, &never).await;
         }
 
         Ok(results)
@@ -1407,7 +1442,7 @@ impl LifecycleService {
                 continue;
             }
 
-            self.run_policy_into(policy, &mut results).await;
+            self.run_policy_into(policy, &mut results, abort).await;
         }
 
         Ok(results)
@@ -1480,6 +1515,7 @@ impl LifecycleService {
             bytes_matched,
             bytes_freed: if dry_run { 0 } else { bytes_matched },
             errors: vec![],
+            proxy_cache: ProxyCacheExecutionResult::default(),
         }
     }
 
@@ -1933,6 +1969,11 @@ impl LifecycleService {
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod policy_scope_tests;
+
+// After the SQL macros for the same reason: its predicate reuses
+// `path_prefix_predicate!`.
+mod proxy_cache;
+pub use proxy_cache::ProxyCacheExecutionResult;
 
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
@@ -3633,6 +3674,7 @@ mod tests {
             bytes_matched: 0,
             bytes_freed: 0,
             errors: vec![],
+            proxy_cache: Default::default(),
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -3654,6 +3696,7 @@ mod tests {
             bytes_matched: 1024,
             bytes_freed: 1024,
             errors: vec!["Error A".to_string(), "Error B".to_string()],
+            proxy_cache: Default::default(),
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"errors\":[\"Error A\",\"Error B\"]"));
@@ -4196,6 +4239,7 @@ mod tests {
             bytes_matched: i64::MAX,
             bytes_freed: i64::MAX,
             errors: vec![],
+            proxy_cache: Default::default(),
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains(&i64::MAX.to_string()));
@@ -4212,6 +4256,7 @@ mod tests {
             bytes_matched: 0,
             bytes_freed: 0,
             errors: vec![],
+            proxy_cache: Default::default(),
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
