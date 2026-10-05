@@ -23,6 +23,7 @@ use crate::api::dto::Pagination;
 // is a drop-in replacement on response types too.
 use crate::api::extractors::Json;
 use crate::api::handlers::is_replication_request;
+use crate::api::handlers::projects;
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -38,7 +39,6 @@ use crate::services::audit_service::{
 };
 use crate::services::cache_classifier;
 use crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
-use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
 use crate::services::quarantine_service;
 use crate::services::repository_service::{
     derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, MemberVisibility,
@@ -3129,9 +3129,9 @@ pub async fn list_repositories(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Repository created", body = RepositoryResponse),
-        (status = 400, description = "Invalid repository configuration or repodata_depth outside 0..1023"),
+        (status = 400, description = "Invalid repository configuration, repodata_depth outside 0..1023, or a key using another project's `<project.key>-` prefix"),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "Insufficient permissions"),
+        (status = 403, description = "Insufficient permissions: needs global admin, system repository admin, or project admin of the requested project_id"),
         (status = 409, description = "Repository key already exists or concurrent layout change; retry"),
         (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
     )
@@ -3151,19 +3151,19 @@ pub async fn create_repository(
     let payload: CreateRepositoryRequest =
         serde_json::from_slice(&body).map_err(|e| AppError::Validation(e.to_string()))?;
 
-    // Fine-grained permission check: non-admins need "admin" on the system sentinel.
-    if !auth.is_admin {
-        let has_perm = state
-            .permission_service
-            .check_permission(
-                auth.user_id,
-                SYSTEM_TARGET_TYPE,
-                SYSTEM_SENTINEL_ID,
-                "admin",
-                false,
-            )
-            .await?;
-        if !has_perm {
+    // Fine-grained permission check: non-admins need "admin" on the system
+    // sentinel or (#2473) project-admin on the project the request assigns
+    // the new repository to, so a project admin creates only inside their
+    // own project. `provisioner` (global or system-sentinel admin) also
+    // decides the creator's owner auto-grant below: a creator authorised only
+    // through a revocable project grant must not receive a durable owner role.
+    let provisioner = projects::has_system_repo_admin(&state, &auth).await?;
+    if !provisioner {
+        let allowed = match payload.project_id {
+            Some(project_id) => projects::is_project_admin(&state, &auth, project_id).await?,
+            None => false,
+        };
+        if !allowed {
             return Err(AppError::Authorization(
                 "Insufficient permissions to create repositories".to_string(),
             ));
@@ -3348,6 +3348,10 @@ pub async fn create_repository(
                 project_id
             )));
         }
+        // Opt-in key-prefix convention (#2473): a key using a project's
+        // `<project.key>-` prefix must be created in that project.
+        projects::validate_repo_key_project_prefix(&state, &payload.key, project_id, auth.is_admin)
+            .await?;
     }
 
     // #3855: a public repository contradicts a server-wide guest-access
@@ -3361,7 +3365,7 @@ pub async fn create_repository(
     )?;
 
     let repo = service
-        .create_with_repodata_depth(
+        .create_with_options(
             ServiceCreateRepoReq {
                 key: payload.key,
                 name: payload.name,
@@ -3386,11 +3390,12 @@ pub async fn create_repository(
                 // Keyless-sync unverified-ingest opt-in (#2569). Fail-closed by
                 // default; only an explicit `true` opts into unverified ingest.
                 curation_allow_unverified: payload.curation_allow_unverified,
-                // Owner auto-grant: record the creator and grant them per-repo
-                // access so they retain access under per-repo authorization.
+                // Always record the creator. The owner role auto-grant is
+                // applied only for provisioners (see `provisioner` above).
                 created_by: Some(auth.user_id),
             },
             payload.repodata_depth.unwrap_or(0),
+            provisioner,
         )
         .await?;
 
@@ -4179,9 +4184,9 @@ pub async fn get_repository_storage_tree(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Repository updated", body = RepositoryResponse),
-        (status = 400, description = "Invalid repository configuration or repodata_depth outside 0..1023"),
+        (status = 400, description = "Invalid repository configuration, repodata_depth outside 0..1023, or a renamed/reassigned key using another project's `<project.key>-` prefix"),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "Insufficient permissions"),
+        (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id"),
         (status = 404, description = "Repository not found"),
         (status = 409, description = "Repository key conflict, nonempty repository depth change, or concurrent layout change"),
         (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
@@ -4257,6 +4262,37 @@ pub async fn update_repository(
         }
     }
 
+    // Projects (#2473): (re)assigning a repository to a different project
+    // needs a global admin, a system repo-admin, or project-admin on the
+    // DESTINATION project (global admins short-circuit without DB work).
+    // Repository admin alone (which a project admin holds on its repositories
+    // by inheritance) must not push a repository into a project the caller
+    // does not administer. When the key or the assignment changes, the
+    // opt-in key-prefix convention is re-validated for the result.
+    let reassigned_to = payload
+        .project_id
+        .filter(|p| existing.project_id != Some(*p));
+    if let Some(project_id) = reassigned_to {
+        if !projects::can_assign_to_project(&state, &auth, project_id).await? {
+            return Err(AppError::Authorization(
+                "Project admin access to the destination project required".to_string(),
+            ));
+        }
+    }
+    let key_changed = payload.key.as_deref().is_some_and(|k| k != existing.key);
+    if key_changed || reassigned_to.is_some() {
+        if let Some(project_id) = payload.project_id.or(existing.project_id) {
+            let effective_key = payload.key.as_deref().unwrap_or(&existing.key);
+            projects::validate_repo_key_project_prefix(
+                &state,
+                effective_key,
+                project_id,
+                auth.is_admin,
+            )
+            .await?;
+        }
+    }
+
     // #3855: flipping a repository to public contradicts a server-wide
     // guest-access disable; refuse it explicitly rather than silently keeping
     // the repository non-public while answering 200. An absent field, a
@@ -4307,6 +4343,15 @@ pub async fn update_repository(
             payload.repodata_depth,
         )
         .await?;
+
+    // #2473: project-inherited grants on this repository just changed, so
+    // drop cached resolutions now instead of serving the source project's
+    // members their old actions for up to the cache TTL. (Other replicas
+    // are not notified: the `repositories` change trigger does not watch
+    // `project_id` yet, a tracked follow-up.)
+    if reassigned_to.is_some() {
+        state.permission_service.invalidate_cache();
+    }
 
     if let Some(ref index_url) = payload.index_upstream_url {
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
@@ -11673,6 +11718,7 @@ mod tests {
 
     use super::*;
     use crate::error::AppError;
+    use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
 
     // -----------------------------------------------------------------------
     // Storage stats: the whole-instance aggregate `instance_unique_bytes` is
