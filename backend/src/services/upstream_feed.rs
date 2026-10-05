@@ -49,6 +49,7 @@ use url::Url;
 use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::services::cluster_lock::{lease_object_id, ClusterLock, PgAdvisoryLock};
+use crate::services::cluster_work::WorkerIdentity;
 use crate::services::npm_packument_cache::{self, NpmPackumentCache};
 
 /// Advisory-lock class for upstream-feed consumers. Distinct from
@@ -325,20 +326,31 @@ fn feed_root_url(feed_url: &Url) -> Result<Url> {
     root.set_query(None);
     root.set_fragment(None);
     {
-        let mut segs = root.path_segments_mut().map_err(|()| {
-            AppError::Config(format!("npm feed URL '{feed_url}' cannot be a base"))
-        })?;
+        let mut segs = root
+            .path_segments_mut()
+            .map_err(|()| not_a_base_error(feed_url))?;
         // Drop the empty segment a trailing slash leaves behind first.
         segs.pop_if_empty();
     }
     let ends_in_changes = root.path_segments().and_then(|mut s| s.next_back()) == Some("_changes");
     if ends_in_changes {
         root.path_segments_mut()
-            .map_err(|()| AppError::Config(format!("npm feed URL '{feed_url}' cannot be a base")))?
+            .map_err(|()| not_a_base_error(feed_url))?
             .pop()
             .push("");
     }
     Ok(root)
+}
+
+/// The error for a feed URL that cannot be a base. It names only the scheme:
+/// a non-hierarchical "URL" such as `user:pw@host` parses with the secret in
+/// its path, where [`without_userinfo`] cannot strip it, and this message can
+/// reach `last_error` in the admin status response (#3069).
+fn not_a_base_error(feed_url: &Url) -> AppError {
+    AppError::Config(format!(
+        "npm feed URL (scheme '{}') cannot be a base",
+        feed_url.scheme()
+    ))
 }
 
 /// Adapter for npm's public replication feed. Polls `_changes?since&limit`
@@ -677,8 +689,20 @@ impl Drop for RunningGuard {
 
 /// Admin view of the npm upstream change-feed (#3069), served by
 /// `GET /api/v1/admin/npm/upstream-feed/status`.
+///
+/// Mixed scope: `consumer_running`, `is_leader` and `last_error` describe
+/// only the replica named by `replica_id` (the one that answered this call);
+/// `enabled`/`feed_url` are that replica's effective configuration; `cursor`,
+/// `last_poll_at` and `cluster_leader_active` are cluster-wide (read from the
+/// shared database). Behind a load balancer, repeated calls may be answered
+/// by different replicas.
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct NpmUpstreamFeedStatus {
+    /// Which replica answered, as `<host>:<pid>:<boot-uuid>` (`<host>` is
+    /// `POD_NAME`, else `HOSTNAME`). The per-replica fields below
+    /// (`consumer_running`, `is_leader`, `last_error`) describe this replica
+    /// only.
+    pub replica_id: String,
     /// Effective `NPM_UPSTREAM_FEED_ENABLED`.
     pub enabled: bool,
     /// Effective `NPM_UPSTREAM_FEED_URL`, with userinfo and query string
@@ -784,6 +808,7 @@ pub async fn npm_feed_status(
         None => (None, None, false),
     };
     Ok(NpmUpstreamFeedStatus {
+        replica_id: WorkerIdentity::for_process().as_str().to_string(),
         enabled: config.npm_upstream_feed_enabled,
         feed_url,
         cursor,
@@ -1245,6 +1270,14 @@ mod tests {
         }
         assert_eq!(failure_log_level(20), FeedLogLevel::Warn);
         assert_eq!(failure_log_level(30), FeedLogLevel::Warn);
+    }
+
+    #[test]
+    fn feed_root_url_error_never_echoes_the_configured_url() {
+        let url = Url::parse("user:s3cret@registry.example").unwrap();
+        let err = feed_root_url(&url).expect_err("non-base URL").to_string();
+        assert!(!err.contains("s3cret"), "{err}");
+        assert!(err.contains("scheme 'user'"), "{err}");
     }
 
     #[test]
@@ -2183,6 +2216,7 @@ mod tests {
             .await
             .expect("status");
         assert!(empty.enabled);
+        assert_eq!(empty.replica_id, WorkerIdentity::for_process().as_str());
         assert!(!empty.feed_url.contains("u:p@"), "{}", empty.feed_url);
         assert_eq!(empty.cursor, None);
         assert_eq!(empty.last_poll_at, None);
