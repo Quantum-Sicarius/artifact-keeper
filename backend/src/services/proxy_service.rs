@@ -34,6 +34,7 @@ use crate::services::proxy_hydration::{
 };
 use crate::services::quarantine_service;
 use crate::services::storage_service::StorageService;
+use crate::services::upstream_tracing::send_upstream;
 
 /// Default byte ceiling for a buffered upstream *metadata* read (#1608 Phase 4b
 /// / #2181). Every buffered metadata proxy fetch is bounded so a hostile or
@@ -2689,7 +2690,7 @@ impl UpstreamClient {
             request = request.header(ACCEPT, accept_value);
         }
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
         })?;
 
@@ -2760,7 +2761,7 @@ impl UpstreamClient {
         }
         request = apply_custom_ua(request, custom_ua.as_deref());
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             classify_send_error(e, &format!("POST JSON to upstream {}", diagnostic_url))
         })?;
 
@@ -2912,7 +2913,7 @@ impl UpstreamClient {
         // both the initial request and the retry. This asymmetry is deliberate
         // and MUST NOT be "unified" — do not add `Accept` here (#1618 S8 review).
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
         })?;
 
@@ -3046,7 +3047,7 @@ impl UpstreamClient {
                 let retry_request = build_request(client.get(url).bearer_auth(&token));
 
                 let retry_diagnostic_url = redact_url_for_diagnostics(url);
-                let retry_response = retry_request.send().await.map_err(|e| {
+                let retry_response = send_upstream(retry_request).await.map_err(|e| {
                     classify_send_error(
                         e,
                         &format!(
@@ -3142,7 +3143,7 @@ impl UpstreamClient {
 
         tracing::debug!("Requesting bearer token from {} (scope={})", realm, scope);
 
-        let token_response = token_request.send().await.map_err(|e| {
+        let token_response = send_upstream(token_request).await.map_err(|e| {
             AppError::Storage(format!(
                 "Failed to request bearer token from {}: {}",
                 realm, e
@@ -3474,7 +3475,7 @@ impl UpstreamClient {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             AppError::Storage(format!("Failed to check upstream for changes: {}", e))
         })?;
 
@@ -5741,7 +5742,7 @@ impl ProxyService {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
 
-        let response = request.send().await.map_err(|e| {
+        let response = send_upstream(request).await.map_err(|e| {
             // Redact the target URL (may carry `user:pass@` upstream creds) and
             // drop the URL reqwest embeds in its own error (#2926) before this
             // surfaces to a client.
