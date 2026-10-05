@@ -169,6 +169,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Load configuration
     let config = Config::from_env()?;
+    artifact_keeper_backend::api::middleware::tracing::warn_if_trace_context_untrusted(&config);
 
     // Log active allocator
     #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
@@ -1083,6 +1084,12 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // ownership. The clone only happens when METRICS_PORT is actually configured.
     let metrics_state = config.metrics_port.map(|_| state.clone());
 
+    // Trusted-proxy ranges for the `http_request` span builder below (#4195),
+    // shared into the per-request closure without copying the list.
+    let trace_context_trusted_proxies: std::sync::Arc<
+        [artifact_keeper_backend::api::middleware::rate_limit::CidrRange],
+    > = config.rate_limit_trusted_proxy_cidrs.clone().into();
+
     // Build router
     let app = Router::new()
         .merge(api::routes::create_router(state))
@@ -1178,7 +1185,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             artifact_keeper_backend::api::middleware::security_headers::security_headers_middleware,
         ))
         .layer(TraceLayer::new_for_http().make_span_with(
-            artifact_keeper_backend::api::middleware::tracing::make_http_request_span,
+            move |request: &axum::http::Request<axum::body::Body>| {
+                // Inbound W3C trace context is adopted only from trusted
+                // proxies once RATE_LIMIT_TRUSTED_PROXY_CIDRS is set (#4195).
+                artifact_keeper_backend::api::middleware::tracing::make_http_request_span(
+                    request,
+                    &trace_context_trusted_proxies,
+                )
+            },
         ));
 
     // The concrete shutdown token used by all servers and background tasks
@@ -1196,7 +1210,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .unwrap_or_else(|_| "9090".to_string())
         .parse::<u16>()
         .unwrap_or(9090);
-    let grpc_addr: SocketAddr = format!("0.0.0.0:{}", grpc_port).parse()?;
+    // `SocketAddr::new` rather than a `format!`ed string so an IPv6 bind IP
+    // (`::1`) needs no brackets (#2161).
+    let grpc_addr = SocketAddr::new(config.grpc_bind_ip, grpc_port);
 
     // Reuse the existing pool instead of creating a second one (PgPool is Arc-backed)
     let sbom_server = SbomGrpcServer::new(grpc_db_pool.clone());
@@ -1271,10 +1287,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     if let (Some(metrics_port), Some(metrics_state)) = (config.metrics_port, metrics_state) {
         tracing::warn!(
             port = metrics_port,
+            bind_ip = %config.metrics_bind_ip,
             "Starting unauthenticated metrics listener - \
              ensure this port is not reachable from untrusted networks"
         );
-        let metrics_addr: SocketAddr = format!("0.0.0.0:{}", metrics_port).parse()?;
+        let metrics_addr = SocketAddr::new(config.metrics_bind_ip, metrics_port);
         let metrics_shutdown = shutdown_token.clone();
         tokio::spawn(async move {
             let metrics_app = Router::new()
