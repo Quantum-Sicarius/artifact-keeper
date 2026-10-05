@@ -2008,7 +2008,15 @@ pub(crate) fn format_label(format: &RepositoryFormat) -> &'static str {
 }
 
 /// Drop any `dist-tags` entry whose target version is no longer present in the
-/// filtered packument, then re-point `latest` to the newest surviving version.
+/// filtered packument, then re-point `latest` if the gate removed its target.
+///
+/// `latest` is the publisher's choice, so a surviving `latest` is kept even when
+/// a higher prerelease also survived: re-pointing it to the newest version would
+/// hand `npm install pkg` a nightly. When the gate removed it, the replacement is
+/// the newest allowed release at or below the old `latest`, then the newest
+/// allowed release, then the newest allowed version of any kind. A blocked
+/// prerelease `latest` is therefore replaced by a release whenever one
+/// survives.
 ///
 /// `allowed` is the set of versions that survived age-gate filtering and must be
 /// sorted newest-first. When `allowed` is empty every tag is removed, leaving an
@@ -2021,8 +2029,27 @@ fn reconcile_dist_tags(packument: &mut serde_json::Value, allowed: &[String]) {
     else {
         return;
     };
+    let previous_latest = dist_tags
+        .get("latest")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
     dist_tags.retain(|_tag, target| target.as_str().is_some_and(|v| allowed_set.contains(v)));
-    if let Some(latest) = allowed.first() {
+    if dist_tags.contains_key("latest") {
+        return;
+    }
+
+    let is_release = |v: &&String| split_version_prerelease(v).1.is_none();
+    let replacement = allowed
+        .iter()
+        .filter(is_release)
+        .find(|v| {
+            previous_latest
+                .as_deref()
+                .is_none_or(|latest| version_compare(v, latest) <= 0)
+        })
+        .or_else(|| allowed.iter().find(is_release))
+        .or_else(|| allowed.first());
+    if let Some(latest) = replacement {
         dist_tags.insert(
             "latest".to_string(),
             serde_json::Value::String(latest.clone()),
@@ -2715,6 +2742,96 @@ mod tests {
         });
         reconcile_dist_tags(&mut packument, &["2.0.0".to_string(), "1.0.0".to_string()]);
         assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("2.0.0"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_keeps_surviving_latest_over_newer_prerelease() {
+        // typescript: `latest` is a release, nightlies above it are allowed too.
+        // `npm install typescript` must keep resolving to the release.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "7.0.2", "next": "7.1.0-dev.20260926.1" },
+            "versions": { "7.0.2": {}, "7.1.0-dev.20260926.1": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &["7.1.0-dev.20260926.1".to_string(), "7.0.2".to_string()],
+        );
+        let tags = packument["dist-tags"].as_object().unwrap();
+        assert_eq!(tags.get("latest"), Some(&serde_json::json!("7.0.2")));
+        assert_eq!(
+            tags.get("next"),
+            Some(&serde_json::json!("7.1.0-dev.20260926.1"))
+        );
+    }
+
+    #[test]
+    fn reconcile_dist_tags_repoints_blocked_latest_to_a_release_not_a_prerelease() {
+        // `latest` was blocked; the newest survivor is a prerelease and a release
+        // line above the old `latest` survives as well. Neither is a fit for
+        // `latest`: the replacement is the newest release at or below it.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "7.0.2" },
+            "versions": { "8.0.0": {}, "7.1.0-dev.1": {}, "7.0.1": {}, "7.0.0": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &[
+                "8.0.0".to_string(),
+                "7.1.0-dev.1".to_string(),
+                "7.0.1".to_string(),
+                "7.0.0".to_string(),
+            ],
+        );
+        assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("7.0.1"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_takes_a_newer_release_when_none_at_or_below_latest_survives() {
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "3.0.0-rc.1": {}, "3.0.0": {}, "2.0.0": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &[
+                "3.0.0".to_string(),
+                "3.0.0-rc.1".to_string(),
+                "2.0.0".to_string(),
+            ],
+        );
+        assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("3.0.0"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_replaces_a_blocked_prerelease_latest_with_a_release() {
+        // A publisher may tag a prerelease as `latest`. When the gate blocks
+        // it, the replacement is the newest release below it, not an older
+        // prerelease of the same line.
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "3.0.0-beta.5" },
+            "versions": { "3.0.0-beta.4": {}, "2.9.0": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &["3.0.0-beta.4".to_string(), "2.9.0".to_string()],
+        );
+        assert_eq!(packument["dist-tags"]["latest"], serde_json::json!("2.9.0"));
+    }
+
+    #[test]
+    fn reconcile_dist_tags_falls_back_to_a_prerelease_when_no_release_survives() {
+        let mut packument = serde_json::json!({
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "1.0.0-rc.2": {}, "1.0.0-rc.1": {} },
+        });
+        reconcile_dist_tags(
+            &mut packument,
+            &["1.0.0-rc.2".to_string(), "1.0.0-rc.1".to_string()],
+        );
+        assert_eq!(
+            packument["dist-tags"]["latest"],
+            serde_json::json!("1.0.0-rc.2")
+        );
     }
 
     #[test]
