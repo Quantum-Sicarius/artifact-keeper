@@ -9872,6 +9872,7 @@ mod tests {
                     fixed_version: None,
                     source: None,
                     source_url: None,
+                    finding_class: crate::models::security::FindingClass::Vulnerability,
                 }],
                 ..Default::default()
             })
