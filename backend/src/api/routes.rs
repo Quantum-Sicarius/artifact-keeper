@@ -1028,6 +1028,10 @@ fn api_v1_routes(
                 admin_middleware,
             )),
         )
+        // Public webhook JWKS (#921): receivers verify `v2=` signatures
+        // against it without credentials. No auth layer; also exempt from the
+        // guest-access guard (`guest_access::is_allowlisted`).
+        .nest("/webhooks", handlers::webhooks::public_router())
         // Webhook routes with auth middleware
         .nest(
             "/webhooks",
@@ -1735,5 +1739,40 @@ mod tests {
             String::from_utf8_lossy(&spec_body).contains("\"paths\""),
             "ENABLE_SWAGGER=true must serve the real OpenAPI document"
         );
+    }
+
+    /// #921: the webhook JWKS answers an anonymous caller even with guest
+    /// access disabled (receivers hold no credentials), while the rest of
+    /// `/api/v1/webhooks` stays gated.
+    #[tokio::test]
+    async fn webhook_jwks_is_public_with_guest_access_disabled_921() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        use crate::api::handlers::test_db_helpers as tdh;
+        // Env-pinned so the runtime `system_settings` row (#867) cannot turn
+        // the guard back on underneath this test.
+        let state = tdh::build_state_with(pool, "/tmp/jwks-921", |c| {
+            c.guest_access_enabled = false;
+            c.guest_access_env_pinned = true;
+        });
+        let app = super::create_router(state);
+        let (status, body, headers) =
+            tdh::send_with_headers(app.clone(), tdh::get("/api/v1/webhooks/jwks".to_string()))
+                .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=300")
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&body).expect("JWKS is JSON");
+        assert!(
+            doc["keys"].is_array(),
+            "JWKS must carry a keys array: {doc}"
+        );
+        let (list_status, _) = tdh::send(app, tdh::get("/api/v1/webhooks".to_string())).await;
+        assert_eq!(list_status, axum::http::StatusCode::UNAUTHORIZED);
     }
 }
