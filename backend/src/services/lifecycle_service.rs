@@ -845,9 +845,10 @@ pub(crate) fn parse_i64_field(
 }
 
 /// Pull a non-empty regex pattern string from `policy.config["pattern"]`.
-/// Caller is responsible for `regex::Regex::new` validation; the database
-/// also re-validates via `name ~ $2` / `name !~ $2`, so the field is only
-/// required to be a string here.
+/// The pattern is a PostgreSQL regex, compiled by PostgreSQL when the policy
+/// is created or updated (`validate_regexes_in_postgres`, #4461) and again by
+/// `name ~ $2` / `name !~ $2`, so the field is only required to be a string
+/// here.
 pub(crate) fn parse_pattern_field(
     config: &serde_json::Value,
     policy_type_label: &str,
@@ -914,8 +915,10 @@ pub(crate) struct PolicyExclusions {
     /// Exact `artifacts.version` values that are never deleted
     /// (`["latest", "stable"]`).
     pub(crate) versions: Vec<String>,
-    /// POSIX regexes matched against `artifacts.version`; a match protects the
-    /// artifact (`["^v[0-9]+\\.[0-9]+\\.[0-9]+$"]`).
+    /// PostgreSQL (ARE) regexes matched against `artifacts.version`, unanchored
+    /// unless they use `^` / `$`; a match protects the artifact
+    /// (`["^v[0-9]+\\.[0-9]+\\.[0-9]+$"]`). Compiled by PostgreSQL at
+    /// create/update time (#4461); use `\\y`, not `\\b`, for a word boundary.
     pub(crate) version_patterns: Vec<String>,
 }
 
@@ -985,11 +988,6 @@ pub(crate) fn parse_exclusions(config: &serde_json::Value) -> Result<PolicyExclu
 
     let versions = parse_exclude_string_array(exclude, "versions")?;
     let version_patterns = parse_exclude_string_array(exclude, "version_patterns")?;
-    for pattern in &version_patterns {
-        regex::Regex::new(pattern).map_err(|e| {
-            AppError::Validation(format!("Invalid regex in exclude.version_patterns: {e}"))
-        })?;
-    }
 
     Ok(PolicyExclusions {
         versions,
@@ -1071,69 +1069,14 @@ pub(crate) fn parse_match(config: &serde_json::Value) -> Result<(Option<String>,
     }
     let path_prefix = parse_match_string(map, "path_prefix")?;
     let version_pattern = parse_match_string(map, "version_pattern")?;
+    // Not compiled here: the pattern is a PostgreSQL regex, compiled by
+    // PostgreSQL at create/update time (`validate_regexes_in_postgres`). The
+    // Rust `regex` crate both accepts patterns PostgreSQL rejects and rejects
+    // valid ones such as the `\y` word boundary (#4461).
     if let Some(pattern) = &version_pattern {
-        regex::Regex::new(pattern).map_err(|e| {
-            AppError::Validation(format!("Invalid regex in match.version_pattern: {e}"))
-        })?;
-        reject_backspace_escape(pattern)?;
+        reject_backspace_escape("match.version_pattern", pattern)?;
     }
     Ok((path_prefix, version_pattern))
-}
-
-/// `\b` and `\B` validate as word-boundary escapes in the Rust `regex` crate
-/// but mean "backspace" and "backslash" in a PostgreSQL regex, so a scope
-/// written with them would silently match nothing. PostgreSQL spells word
-/// boundaries `\y` / `\Y`.
-fn reject_backspace_escape(pattern: &str) -> Result<()> {
-    let mut chars = pattern.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' && matches!(chars.next(), Some('b' | 'B')) {
-            return Err(AppError::Validation(
-                "match.version_pattern: \\b and \\B are not word boundaries in a PostgreSQL \
-                 regex; use \\y / \\Y"
-                    .to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// SQLSTATE `invalid_regular_expression`.
-const INVALID_REGULAR_EXPRESSION: &str = "2201B";
-
-/// Map a failed PostgreSQL regex compile to a validation error; anything else
-/// stays a database error.
-fn postgres_regex_error(code: Option<&str>, message: &str) -> AppError {
-    if code == Some(INVALID_REGULAR_EXPRESSION) {
-        AppError::Validation(format!(
-            "match.version_pattern is not a valid PostgreSQL regular expression: {message}"
-        ))
-    } else {
-        AppError::Database(message.to_string())
-    }
-}
-
-/// Compile `match.version_pattern` with the engine that runs it. The pattern
-/// is executed by PostgreSQL (`version ~ $N`), whose regex dialect differs
-/// from the Rust `regex` crate `parse_match` checks with: `\z`, `\pL`,
-/// `(?P<name>...)` or a mid-pattern `(?i)` pass the Rust check and then fail
-/// every run. Called at create/update time, inside the write transaction.
-pub(crate) async fn validate_version_pattern_in_postgres(
-    conn: &mut sqlx::PgConnection,
-    config: &serde_json::Value,
-) -> Result<()> {
-    let (_, Some(pattern)) = parse_match(config)? else {
-        return Ok(());
-    };
-    sqlx::query("SELECT '' ~ $1")
-        .bind(&pattern)
-        .execute(conn)
-        .await
-        .map(|_| ())
-        .map_err(|e| match e.as_database_error() {
-            Some(db) => postgres_regex_error(db.code().as_deref(), db.message()),
-            None => AppError::Database(e.to_string()),
-        })
 }
 
 /// Parse a policy's [`PolicyFilters`] from its `config`.
@@ -1401,8 +1344,34 @@ impl LifecycleService {
             ));
         }
 
+        let problems = self.stored_regex_problems_of(&policy).await?;
+        if !dry_run {
+            // #4461: a protective pattern (an exclusion, or the keep pattern
+            // of tag_pattern_keep) that PostgreSQL reads differently from how
+            // it was validated fails open and deletes what it should keep.
+            // Refuse the live run; the stored config is left as it is.
+            if let Some(problem) = problems.iter().find(|p| p.fails_open(&policy.policy_type)) {
+                return Err(AppError::Validation(format!(
+                    "Refusing to run lifecycle policy '{}': {}. This pattern protects \
+                     artifacts and would protect nothing as written; fix the policy",
+                    policy.name, problem.message
+                )));
+            }
+        }
+
         let repositories = self.resolve_repositories(&policy).await?;
         let mut result = Self::build_execution_result(&policy, dry_run, 0, 0, 0);
+        if dry_run {
+            // Report every stored-regex problem in the preview, and stop when
+            // a pattern cannot compile at all (the run would only error out).
+            let blocked = problems.iter().any(|p| p.blocks_run());
+            result
+                .errors
+                .extend(problems.into_iter().map(|p| p.message));
+            if blocked {
+                return Ok(result);
+            }
+        }
         if repositories.is_empty() {
             return Ok(result);
         }
@@ -1437,6 +1406,23 @@ impl LifecycleService {
             .map_err(|e| AppError::Database(e.to_string()))?;
         }
         Ok(result)
+    }
+
+    /// The stored-regex problems of `policy` (#4461), checked on one pooled
+    /// connection under the compile timeout.
+    async fn stored_regex_problems_of(
+        &self,
+        policy: &LifecyclePolicy,
+    ) -> Result<Vec<regexes::StoredRegexProblem>> {
+        if policy_regexes(&policy.policy_type, &policy.config).is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        stored_regex_problems(&mut conn, &policy.policy_type, &policy.config).await
     }
 
     async fn execute_in_repository(
@@ -2124,6 +2110,16 @@ impl LifecycleService {
         // bad `exclude`/`match` block is a 422 at create/update time rather
         // than a surprise at sweep time.
         parse_policy_filters(config)?;
+        let version_patterns = parse_exclusions(config)?.version_patterns.len();
+        if version_patterns > MAX_VERSION_PATTERNS {
+            return Err(AppError::Validation(format!(
+                "exclude.version_patterns has {version_patterns} entries; at most \
+                 {MAX_VERSION_PATTERNS} are allowed"
+            )));
+        }
+        for (field, pattern) in policy_regexes(policy_type, config) {
+            reject_static_regex_problems(&field, &pattern)?;
+        }
         if matches!(policy_type, "max_age_days" | "composite") {
             parse_min_keep(config)?;
         }
@@ -2163,7 +2159,9 @@ impl LifecycleService {
                 check_window_days(days, "no_downloads_days 'days'")?;
             }
             "tag_pattern_keep" | "tag_pattern_delete" => {
-                let pattern = config
+                // Only the shape is checked here; the regex itself is compiled
+                // by PostgreSQL at create/update time (#4461).
+                config
                     .get("pattern")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| {
@@ -2172,9 +2170,6 @@ impl LifecycleService {
                             policy_type
                         ))
                     })?;
-                // Validate regex
-                regex::Regex::new(pattern)
-                    .map_err(|e| AppError::Validation(format!("Invalid regex pattern: {}", e)))?;
             }
             "composite" => {
                 conditions::parse_conditions(config)?;
@@ -2199,12 +2194,28 @@ impl LifecycleService {
 #[cfg(test)]
 mod policy_scope_tests;
 
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod regex_tests;
+
 // After the SQL macros for the same reason: its predicate reuses
 // `path_prefix_predicate!`.
 mod proxy_cache;
 // After the SQL macros: it expands the `retention_*` family.
 mod conditions;
+// Lifecycle regexes are PostgreSQL regexes (#4461).
+mod regexes;
 pub use proxy_cache::ProxyCacheExecutionResult;
+pub use regexes::warn_invalid_lifecycle_regexes;
+#[cfg(test)]
+pub(crate) use regexes::{
+    compile_in_postgres, has_backspace_escape, invalid_regex_policies, postgres_regex_error,
+    StoredRegexIssue, MAX_REGEX_BYTES,
+};
+pub(crate) use regexes::{
+    policy_regexes, reject_backspace_escape, reject_static_regex_problems, stored_regex_problems,
+    validate_regexes_in_postgres, MAX_VERSION_PATTERNS,
+};
 
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
@@ -3729,14 +3740,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_tag_pattern_invalid_regex() {
-        let svc = make_service_for_validation();
-        let config = json!({"pattern": "[invalid"});
-        let result = svc.validate_policy_config("tag_pattern_delete", &config);
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_validate_tag_pattern_integer_pattern() {
         let svc = make_service_for_validation();
         let config = json!({"pattern": 42});
@@ -3976,16 +3979,6 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("pattern"));
-    }
-
-    #[tokio::test]
-    async fn test_validate_tag_pattern_keep_invalid_regex() {
-        let svc = make_service_for_validation();
-        let config = json!({"pattern": "[unclosed"});
-        let result = svc.validate_policy_config("tag_pattern_keep", &config);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("regex"));
     }
 
     #[tokio::test]
@@ -4355,14 +4348,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_tag_pattern_delete_invalid_nested_groups() {
-        let svc = make_service_for_validation();
-        let config = json!({"pattern": "((("});
-        let result = svc.validate_policy_config("tag_pattern_delete", &config);
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_validate_tag_pattern_null_pattern() {
         let svc = make_service_for_validation();
         let config = json!({"pattern": null});
@@ -4422,17 +4407,6 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("size_quota_bytes"));
         assert!(msg.contains("quota_bytes"));
-    }
-
-    #[tokio::test]
-    async fn test_validate_tag_pattern_invalid_regex_error_message() {
-        let svc = make_service_for_validation();
-        let config = json!({"pattern": "[bad"});
-        let err = svc
-            .validate_policy_config("tag_pattern_keep", &config)
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("regex"), "Error should mention regex");
     }
 
     // -----------------------------------------------------------------------
@@ -6057,18 +6031,6 @@ mod tests {
             )
             .expect_err("a misspelled key inside exclude must be rejected");
         assert!(err.to_string().contains("version_pattern"));
-    }
-
-    #[tokio::test]
-    async fn test_exclude_rejects_invalid_regex_2024() {
-        let service = make_service_for_validation();
-        let err = service
-            .validate_policy_config(
-                "max_age_days",
-                &json!({"days": 14, "exclude": {"version_patterns": ["["]}}),
-            )
-            .expect_err("an uncompilable exclusion regex must be rejected");
-        assert!(err.to_string().contains("exclude.version_patterns"));
     }
 
     #[tokio::test]

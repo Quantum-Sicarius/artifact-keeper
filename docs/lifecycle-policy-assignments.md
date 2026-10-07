@@ -18,7 +18,8 @@ protection remains per policy; it does not protect artifacts from other policies
 Every policy type accepts these optional `config` keys:
 
 - `exclude`: `{"versions": [...], "version_patterns": [...]}` names versions
-  the policy never deletes.
+  the policy never deletes. `versions` are exact matches; `version_patterns`
+  are regexes (see below).
 - `match.path_prefix` limits the policy to artifacts whose repository-relative
   path starts with that literal string.
 - `match.version_pattern` limits the policy to artifacts whose version (the tag,
@@ -27,6 +28,32 @@ Every policy type accepts these optional `config` keys:
   unanchored unless you use `^` / `$`, so `sha-` also matches `release-sha-1`.
   Use `\y`, not `\b`, for a word boundary. A version-less artifact is in scope
   only if the pattern matches the empty string.
+
+Every lifecycle regex -- `match.version_pattern`, each
+`exclude.version_patterns` entry, and the `pattern` of `tag_pattern_keep` /
+`tag_pattern_delete` -- is a **PostgreSQL** (ARE) regular expression, because
+PostgreSQL runs it. Patterns are unanchored unless they use `^` / `$`. When a
+policy is created or updated, each pattern is compiled by PostgreSQL (with a
+2-second limit, on its own connection) and the request returns 400 if:
+
+- PostgreSQL rejects it, for example `\z`, `\pL`, `(?P<name>...)` or a
+  mid-pattern `(?i)`, or it takes too long to compile;
+- it uses `\b` or `\B`. In PostgreSQL these mean backspace and backslash, so
+  `\bstable\b` would protect nothing. Write `\ystable\y` instead;
+- it uses a back-reference (`\1` to `\9`);
+- it is longer than 512 bytes, or `exclude.version_patterns` has more than 64
+  entries.
+
+Policies stored before these checks are not changed. On every start the backend
+logs one WARN per stored policy with a pattern PostgreSQL cannot compile or
+that uses `\b` / `\B`. A preview (`POST /api/v1/admin/lifecycle/{id}/preview`)
+lists the problems in `errors`, and stops with zero matches when a pattern
+cannot compile. A live run refuses (400) a policy whose protective pattern --
+an `exclude.version_patterns` entry, or the `pattern` of `tag_pattern_keep` --
+has such a problem, because it would delete what it was written to keep. A
+`match.version_pattern` or `tag_pattern_delete` pattern with `\b` matches
+nothing, so it still runs and deletes nothing. Fix the policy with
+`PATCH /api/v1/admin/lifecycle/{id}`.
 
 Scope and exclusions filter before `min_keep` / `max_versions` count their kept
 versions, so out-of-scope and excluded versions never take a kept slot.
