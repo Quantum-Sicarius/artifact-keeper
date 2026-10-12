@@ -1606,6 +1606,58 @@ fn is_multipart_etag(etag: &str) -> bool {
     MULTIPART_ETAG_RE.is_match(etag.trim_matches('"'))
 }
 
+/// MD5 of the empty byte string: the single-part ETag every S3-compatible
+/// backend reports for a zero-byte object (S3, MinIO, SeaweedFS, Ceph RGW, R2).
+///
+/// A multipart ETag always carries a `-<partcount>` suffix (see
+/// [`MULTIPART_ETAG_RE`]), so the opaque per-upload values #2120 warns about
+/// can never compare equal to this constant.
+const EMPTY_OBJECT_ETAG_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
+
+/// True when `etag` is the single-part ETag of a zero-byte object. Surrounding
+/// double quotes are stripped first, exactly as [`is_multipart_etag`] does, so
+/// both the raw and the quoted header form are recognized.
+fn etag_is_empty_object(etag: &str) -> bool {
+    etag.trim_matches('"')
+        .eq_ignore_ascii_case(EMPTY_OBJECT_ETAG_MD5)
+}
+
+/// True when a proxy-cache sidecar describes an object that cannot exist: it
+/// vouches for `size_bytes > 0` while pinning the ETag of a zero-byte object
+/// (#4630).
+///
+/// [`CachePersister::tee_stream`] writes the two fields in the same breath --
+/// `size_bytes` from the staging `put_stream`, `storage_etag` from a HEAD of
+/// the live key after the publish `copy()` -- so they disagree only when the
+/// copy published nothing. #1051 ETag revalidation cannot catch that: the pin
+/// was taken from the already-empty object, so it matches on every later HEAD.
+/// The contradiction is visible only *within* the sidecar, which is why this
+/// reads no object and makes no storage call.
+///
+/// Pure, and `false` whenever there is nothing to judge: a filesystem or
+/// pre-#1051 entry has no pin, a multipart ETag never equals the empty-object
+/// MD5, and a backend whose ETag is not an MD5 never matches it either --
+/// Azure's is opaque, and so is the native GCS backend's, which pins the JSON
+/// metadata `etag`. GCS reached through its S3-compatible XML API -- the
+/// configuration #3737 is about -- does report the hex MD5 of a single-part
+/// object, so that one is covered. Entries this cannot judge keep their
+/// existing behavior and are covered by the write-path guard in
+/// [`CachePersister::tee_stream`] instead.
+///
+/// The two halves of #4630 are therefore not symmetric, and the asymmetry is
+/// in the truncated case specifically. The write guard refuses a *new*
+/// publish that lands short, because it compares sizes. This predicate cannot
+/// heal an entry already poisoned that way: a truncated object's pin is that
+/// truncated object's own correct MD5, not the empty-object one, so there is
+/// no contradiction to see here and #1051 revalidation finds the entry clean
+/// on every HEAD. Only the empty case leaves a mark a later reader can
+/// recognize. A pre-existing truncated entry still needs either an eviction
+/// or the read-path length comparison that the follow-up on surfacing
+/// `get_stream`'s object length would make free.
+fn sidecar_pins_empty_object(size_bytes: i64, storage_etag: Option<&str>) -> bool {
+    size_bytes > 0 && storage_etag.is_some_and(etag_is_empty_object)
+}
+
 async fn pin_storage_etag(storage: &StorageService, cache_key: &str) -> Option<String> {
     storage.head_etag(cache_key).await.unwrap_or_else(|e| {
         tracing::debug!(
@@ -1627,6 +1679,76 @@ async fn discard_staging(storage: &StorageService, staging_key: &str) {
             staging_key = %staging_key,
             error = %e,
             "best-effort delete of proxy-cache staging object failed"
+        );
+    }
+}
+
+/// Best-effort removal of an object a publish just landed on the LIVE cache
+/// key and that must not be served (#4630).
+///
+/// The counterpart to [`discard_staging`], for the one reject path that runs
+/// after a `copy()` reported success. Refusing to write the sidecar is enough
+/// on a first fill -- no sidecar, no read -- but not on a refill: the previous
+/// sidecar is still there, now describing the object the bad publish left
+/// behind, and if that object is empty its pinned ETag is a *correct* MD5 of
+/// it, so [`sidecar_pins_empty_object`] has nothing to catch and the entry
+/// serves `Content-Length` over an empty body on every request. Dropping the
+/// object puts the entry back on [`ProxyService::open_cached_stream`]'s
+/// pre-existing `NotFound` self-heal.
+///
+/// A failure leaves the entry exactly as a release without this check would
+/// have left it, which is why it only warns.
+///
+/// # This is the delete-on-mismatch #3153 declined, and why that is now right
+///
+/// #3153 -- the PR that introduced the staging-key publish this arm sits at
+/// the end of -- ruled one out in as many words: "Not adding a reactive
+/// delete-on-mismatch here: that delete could clobber a concurrent writer's
+/// just-published good object, recreating the exact pattern this PR
+/// removes." `S3Backend::multipart_server_side_copy` still carries that
+/// reasoning in its own doc comment. It was correct when it was written.
+/// What changed is not the race; it is what the loser of the race gets.
+///
+/// A wrong delete was dangerous because of what it left *servable*. Before
+/// #3147, [`ProxyService::handle_streaming_leader_upstream_error`] opened the
+/// body first and loaded the sidecar best-effort, so an object on the content
+/// key went out to a client whether or not a sidecar vouched for it -- the
+/// comment at that reader records the history. Removing the right object
+/// could therefore expose the wrong one. Since #3147 every reader gates on
+/// the sidecar, so an object nothing vouches for is inert, and an object that
+/// is simply *absent* is not a hazard at all: it is the input to
+/// [`ProxyService::open_cached_stream`]'s `NotFound` self-heal.
+///
+/// Run the race the carve-out describes, concretely. Replica A's copy lands
+/// empty and replica B's lands the real bytes; A measures the live key, sees
+/// the mismatch, and deletes B's good object. B then commits a sidecar for a
+/// key that holds nothing. The next read loads that sidecar, opens the body,
+/// gets `NotFound`, and takes the self-heal arm -- one extra upstream fetch,
+/// after which the entry is correct. **The worst case of a wrong delete is a
+/// cache miss, not corruption.** Before #3147 the same mistake cost a client
+/// the bad bytes.
+///
+/// That argument has to survive the ordinary case rather than an exotic one.
+/// Cross-replica single-flight (#1609,
+/// `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED`) is opt-in and off by default,
+/// so two replicas publishing the same cold key at once is normal traffic,
+/// not a corner. It does survive it, because the exposure is bounded by a
+/// refetch either way.
+///
+/// The delete is also narrower than the one #3153 turned down. It runs only
+/// after *this* writer's own `copy()` reported success on *this* key, so the
+/// object it removes is one this writer just wrote or replaced moments
+/// earlier. The reject arms that precede the publish are unchanged and still
+/// touch nothing but their own staging key, which is the invariant
+/// `test_tee_concurrent_reject_and_commit_never_touch_live_key_directly`
+/// pins.
+async fn discard_bad_publish(storage: &StorageService, cache_key: &str) {
+    if let Err(e) = storage.delete(cache_key).await {
+        tracing::warn!(
+            cache_key = %cache_key,
+            error = %e,
+            "best-effort delete of a refused proxy-cache publish failed; the live key may \
+             still hold an object no sidecar vouches for (#4630)"
         );
     }
 }
@@ -2116,6 +2238,22 @@ impl CacheStore {
             return false;
         }
 
+        // #4630: refuse to presign a redirect to an object the sidecar itself
+        // contradicts. The #1051 revalidation below cannot catch this one --
+        // the pin was taken from the already-empty object, so the HEAD matches
+        // it and the entry revalidates clean -- and the #3147 length check sits
+        // in the multipart fallback, which a matching single-part ETag never
+        // reaches.
+        if sidecar_pins_empty_object(metadata.size_bytes, metadata.storage_etag.as_deref()) {
+            tracing::warn!(
+                cache_key = %cache_key,
+                size_bytes = metadata.size_bytes,
+                "proxy cache sidecar pins the ETag of an empty object while claiming a \
+                 non-zero size; not fresh (#4630)"
+            );
+            return false;
+        }
+
         // ETag-based integrity revalidation (#1051). Only meaningful when
         // we have a pinned ETag from cache-write time AND the backend
         // surfaces an ETag now. Either side being `None` falls back to
@@ -2236,6 +2374,17 @@ impl CacheStore {
 ///    existence-only semantics.
 /// 3. **Body → sidecar write ordering.** The content object is written
 ///    first, then the cache-metadata sidecar. Never reordered.
+/// 4. **#4630 published-object check.** The streaming path measures the live
+///    key after the publish `copy()` and refuses to write a sidecar when it
+///    does not hold the bytes that were staged, dropping the published object
+///    as well so the entry misses cleanly instead of being described by a
+///    surviving older sidecar. #1365 validates the STAGING write, so without
+///    this a `copy()` that reports success while storing nothing produces a
+///    sidecar with the right size and checksum over a zero-byte body. The
+///    measurement itself is best-effort (a backend that cannot answer the
+///    HEAD commits as before, see [`Self::tee_stream`]); what is unconditional
+///    is that a *measured* disagreement, or an ETag pin that proves the live
+///    object empty, never reaches a sidecar.
 ///
 /// Streaming-tee failure semantics ([`Self::tee_stream`]) are unchanged: a
 /// cache-write failure must not corrupt the client stream, upstream errors
@@ -2616,6 +2765,22 @@ impl CachePersister {
                         // live key via the backend's native copy (atomic —
                         // readers see the old or new version, never a partial
                         // write). A copy failure degrades like a reject.
+                        //
+                        // #4630, for whoever changes this next: this arm
+                        // discards the STAGING object only, which is right
+                        // today because a `copy()` that returns `Err` on
+                        // every backend here either never touched the live
+                        // key or aborted before the destination became
+                        // visible. It stops being right the moment the
+                        // storage layer starts verifying its own copies: if
+                        // `StorageService::copy` ever grows a post-copy
+                        // length or digest check and returns `Err` on
+                        // mismatch, bad publishes stop arriving at the
+                        // measurement arm below and start arriving HERE --
+                        // where nothing drops the live key, so the refill
+                        // poisoning the arm below exists to prevent would
+                        // come straight back. Move the
+                        // `discard_bad_publish` call up with the check.
                         if let Err(e) = storage_clone
                             .copy(&staging_key, &cache_key_for_writer)
                             .await
@@ -2630,6 +2795,90 @@ impl CachePersister {
                             discard_staging(&storage_clone, &staging_key).await;
                             return;
                         }
+                        // #4630: measure what the publish actually landed on
+                        // the live key before writing a sidecar that vouches
+                        // for it. `classify_stream_write` above validated the
+                        // STAGING write; nothing measures the `copy()` between
+                        // them. An S3-compatible endpoint that accepts the
+                        // #3737 `Content-Length: 0` copy PUT without honouring
+                        // `x-amz-copy-source` answers 200 having stored an
+                        // empty object, and the sidecar then carries the right
+                        // size and checksum over a zero-byte body -- which
+                        // streaming reads serve as a permanent 500. This also
+                        // catches a truncated publish, not only an empty one.
+                        match storage_clone.size(&cache_key_for_writer).await {
+                            Ok(published) if published == result.bytes_written => {}
+                            Ok(published) => {
+                                // #4630 diagnostic. `staged_bytes` is what
+                                // `put_stream` REPORTED writing;
+                                // `staging_bytes` is what the source key
+                                // actually holds right now. The two causes
+                                // this guard otherwise cannot tell apart:
+                                // a staging object that reads 0 against a
+                                // non-zero `staged_bytes` points at the
+                                // source (read-after-write lag on the filer,
+                                // a staging write that did not durably
+                                // land), while one that reads back the
+                                // staged size points at the `copy()` itself.
+                                // `S3Backend::copy` already HEADs the source
+                                // but discards the answer, and surfacing it
+                                // means changing `copy`'s signature across
+                                // every backend -- so measure it here
+                                // instead, on a path that has already
+                                // failed. The staging object is still on the
+                                // backend (`discard_staging` runs below), and
+                                // this costs the hot path nothing: a publish
+                                // that matches never reaches this arm.
+                                let staging_bytes = storage_clone.size(&staging_key).await.ok();
+                                tracing::warn!(
+                                    cache_key = %cache_key_for_writer,
+                                    staged_bytes = result.bytes_written,
+                                    published_bytes = published,
+                                    staging_bytes = ?staging_bytes,
+                                    "published proxy-cache object does not have the size that \
+                                     was staged; not caching (no metadata sidecar) and dropping \
+                                     the live key so the next request refetches upstream"
+                                );
+                                // Unlike every other reject arm here, this one
+                                // runs AFTER a `copy()` that reported success,
+                                // so the live key already holds the bad object
+                                // and whatever it replaced is gone. Leaving it
+                                // there is not inert: on a REFILL the previous
+                                // sidecar survives, now describing an empty
+                                // body, and its pin is that body's correct MD5
+                                // -- so the read guard stays silent and the
+                                // entry serves the very 500 this is defending
+                                // against. Dropping it instead makes
+                                // `open_cached_stream`'s `NotFound` self-heal
+                                // fire and the entry miss cleanly.
+                                discard_bad_publish(&storage_clone, &cache_key_for_writer).await;
+                                discard_staging(&storage_clone, &staging_key).await;
+                                return;
+                            }
+                            Err(e) => {
+                                // Best-effort, the same posture as
+                                // `pin_storage_etag`'s HEAD: a storage endpoint
+                                // that cannot answer a HEAD right after a copy
+                                // (read-after-write lag on an S3-compatible
+                                // backend) has not told us the publish was bad,
+                                // only that it cannot be measured. Failing
+                                // closed here would stop proxy caching
+                                // altogether on such a backend -- every request
+                                // a fresh upstream fetch -- with a `warn` as
+                                // the only signal. Carry on without the extra
+                                // assurance; the ETag pin taken below is
+                                // checked for the same contradiction before
+                                // anything is committed, and a transient HEAD
+                                // failure leaves behaviour exactly as it is on
+                                // the released code path.
+                                tracing::warn!(
+                                    cache_key = %cache_key_for_writer,
+                                    error = %e,
+                                    "could not measure the published proxy-cache object; \
+                                     committing the sidecar without that assurance (#4630)"
+                                );
+                            }
+                        }
                         discard_staging(&storage_clone, &staging_key).await;
                         let now = Utc::now();
                         // #1618 S9 / #1051: pin the storage backend's ETag at
@@ -2640,6 +2889,28 @@ impl CachePersister {
                         // error.
                         let storage_etag =
                             pin_storage_etag(&storage_clone, &cache_key_for_writer).await;
+                        // #4630: the pin was just read off the live key, so a
+                        // pin that is the empty-object MD5 while a non-zero
+                        // body was staged proves the publish landed nothing --
+                        // on exactly the backends whose `size()` the arm above
+                        // may not have been able to read. Costs no storage
+                        // call: it re-reads the two values already in hand,
+                        // with the same predicate the read paths apply to a
+                        // sidecar that is already on disk.
+                        if sidecar_pins_empty_object(
+                            result.bytes_written as i64,
+                            storage_etag.as_deref(),
+                        ) {
+                            tracing::warn!(
+                                cache_key = %cache_key_for_writer,
+                                staged_bytes = result.bytes_written,
+                                "published proxy-cache object carries the ETag of an empty \
+                                 object; not caching (no metadata sidecar) and dropping the \
+                                 live key so the next request refetches upstream (#4630)"
+                            );
+                            discard_bad_publish(&storage_clone, &cache_key_for_writer).await;
+                            return;
+                        }
                         let metadata = CacheMetadata {
                             cached_at: now,
                             upstream_etag: template.etag,
@@ -5664,6 +5935,24 @@ impl ProxyService {
         cache_key: &str,
         metadata: &CacheMetadata,
     ) -> Result<Option<StreamingFetchResult>> {
+        // #4630: a sidecar that vouches for N > 0 bytes while pinning the ETag
+        // of a zero-byte object describes an object that cannot exist. Serving
+        // it sends `Content-Length: N` ahead of an empty body and hyper aborts
+        // the connection mid-response, which a reverse proxy renders as a 500
+        // while this process logs `status=200` (the tracing middleware logs
+        // when the handler returns the Response, before the body is polled).
+        // The object is present, so the missing-body arm below can never fire
+        // and the entry 500s on every retry forever. Treat it as that same
+        // miss: the refetch rewrites both objects and the entry self-heals.
+        if sidecar_pins_empty_object(metadata.size_bytes, metadata.storage_etag.as_deref()) {
+            tracing::warn!(
+                cache_key = %cache_key,
+                size_bytes = metadata.size_bytes,
+                "proxy cache sidecar pins the ETag of an empty object while claiming a \
+                 non-zero size; treating as a miss and refetching upstream (#4630)"
+            );
+            return Ok(None);
+        }
         match self.storage.get_stream(cache_key).await {
             Ok(body) => Ok(Some(StreamingFetchResult {
                 body,
@@ -5968,6 +6257,33 @@ impl ProxyService {
                 cache_key = %cache_key,
                 "streaming upstream fetch failed and the cache entry is a negative-cache \
                  marker; refusing to serve the leftover body (stale-if-error, #3147)"
+            );
+            return Err(upstream_err);
+        }
+
+        // #4630: the same self-contradicting sidecar `open_cached_stream`
+        // refuses -- a non-zero `size_bytes` pinned against the ETag of a
+        // zero-byte object. This reader does not go through
+        // `open_cached_stream`: it opens the body itself and takes
+        // `Content-Length` straight off the sidecar, so without this it is a
+        // second way to serve a poisoned entry, reached exactly when upstream
+        // is down and the entry cannot be refetched. The failure is the one
+        // #4630 reports -- `Content-Length: N` ahead of an empty body, the
+        // connection aborted mid-response, logged here as `status=200`.
+        //
+        // Refusing costs the request nothing it had: a sidecar this
+        // contradictory describes no servable body, so the upstream error
+        // propagates, exactly as it does for the two sidecar states checked
+        // around this one. It sits beside them because it is the same class
+        // of reason -- a sidecar that vouches for nothing a client can be
+        // given.
+        if sidecar_pins_empty_object(metadata.size_bytes, metadata.storage_etag.as_deref()) {
+            tracing::warn!(
+                cache_key = %cache_key,
+                size_bytes = metadata.size_bytes,
+                "streaming upstream fetch failed and the cache sidecar pins the ETag of an \
+                 empty object while claiming a non-zero size; refusing to serve it \
+                 (stale-if-error, #4630)"
             );
             return Err(upstream_err);
         }
@@ -11403,6 +11719,41 @@ mod tests {
         );
     }
 
+    /// #4630: the one contradiction #1051 revalidation cannot see. The pin was
+    /// taken off an object that was already empty, so the HEAD below matches
+    /// it and the entry revalidates clean — and #3147's length check sits in
+    /// the multipart fallback, which a matching single-part ETag never
+    /// reaches. This probe is the presigned-redirect gate, so `true` here
+    /// hands the client a 302 straight at a zero-byte object while the
+    /// sidecar, and the `Content-Length` derived from it, claim 42 bytes.
+    /// Positive control: `test_is_cache_fresh_true_when_storage_etag_matches_pin`
+    /// above, where the same matching-pin path still returns true.
+    #[tokio::test]
+    async fn test_is_cache_fresh_false_when_sidecar_pins_an_empty_object_4630() {
+        let empty_object_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                empty_object_etag.to_string(),
+            ))),
+            /* content_exists = */ true,
+            HeadEtagBehavior::Present(empty_object_etag.to_string()),
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash-4630").await;
+
+        assert!(
+            !fresh,
+            "a sidecar pinning the empty-object ETag while claiming 42 bytes must never \
+             authorize a presigned redirect (#4630)"
+        );
+        assert_eq!(
+            mock.head_etag_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "the contradiction is inside the sidecar; catching it must cost no storage call"
+        );
+    }
+
     #[tokio::test]
     async fn test_is_cache_fresh_legacy_entry_falls_back_to_exists_check() {
         // Cache entry written before #1051: `storage_etag = None`. Must
@@ -12040,49 +12391,99 @@ mod tests {
         metadata_writes: tokio::sync::Mutex<Vec<(String, Bytes)>>,
         deletes: tokio::sync::Mutex<Vec<String>>,
         put_stream_fails: bool,
-        copy_fails: bool,
+        /// What `copy()` does to the live key (#4630).
+        publish: PublishBehavior,
+        /// What `head_etag` reports for the live key. `None` (the default)
+        /// keeps the pre-#1051 shape every other tee test expects.
+        etag: Option<String>,
         // #1611-style guard support (used by write_negative_cache tests): a
         // successful put_stream (even a zero-byte one) creates a real
         // object at the key, same as a real S3 PutObject.
         object_written: std::sync::atomic::AtomicBool,
+        // Bytes each successful `put_stream` recorded, by the key it wrote,
+        // and the size `copy()` left on the live key. A real backend's
+        // `size()` reports what the publish landed, which is what #4630's
+        // guard measures; returning a constant here would make that guard
+        // untestable and would fail every commit test. Per key rather than
+        // one counter because two concurrent writers share one backend
+        // (`test_tee_concurrent_reject_and_commit_never_touch_live_key_directly`),
+        // and a shared counter lets one writer's staging size decide the
+        // other's publish.
+        put_stream_totals: tokio::sync::Mutex<HashMap<String, u64>>,
+        published_size: std::sync::atomic::AtomicU64,
+        /// Every key `size()` was asked about, in call order (#4630). The
+        /// refusal arm measures the STAGING key as well as the live one, to
+        /// say in the log whether a bad publish started from a bad source;
+        /// recording the keys is how that diagnostic is pinned, since the
+        /// field itself only exists in a `warn!`.
+        size_keys: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    /// What the publish `copy()` leaves on the live key (#4630). The failure
+    /// this guards against is not "the copy failed" — every reject arm before
+    /// it already covers that — but "the copy reported success and the object
+    /// is not the one that was staged".
+    #[derive(Clone, Copy)]
+    enum PublishBehavior {
+        /// The live key ends up holding exactly the staged bytes.
+        Faithful,
+        /// `copy()` itself returns an error.
+        Fails,
+        /// `copy()` reports success and leaves the live key empty: the shape
+        /// an S3-compatible endpoint produces when it accepts the #3737
+        /// `Content-Length: 0` copy PUT without honouring `x-amz-copy-source`.
+        LandsEmpty,
+        /// `copy()` reports success and leaves the live key short.
+        LandsTruncated(u64),
+        /// `copy()` reports success and lands the staged bytes, but the live
+        /// key cannot be measured afterwards — a HEAD failure, the shape
+        /// read-after-write lag on an S3-compatible endpoint produces.
+        Unmeasurable,
     }
 
     impl TeeRecordingBackend {
-        fn ok() -> Arc<Self> {
-            Arc::new(Self {
+        fn build(put_stream_fails: bool, publish: PublishBehavior) -> Self {
+            Self {
                 put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_keys: tokio::sync::Mutex::new(Vec::new()),
                 copies: tokio::sync::Mutex::new(Vec::new()),
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
                 deletes: tokio::sync::Mutex::new(Vec::new()),
-                put_stream_fails: false,
-                copy_fails: false,
+                put_stream_fails,
+                publish,
+                etag: None,
                 object_written: std::sync::atomic::AtomicBool::new(false),
-            })
+                put_stream_totals: tokio::sync::Mutex::new(HashMap::new()),
+                published_size: std::sync::atomic::AtomicU64::new(0),
+                size_keys: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn ok() -> Arc<Self> {
+            Arc::new(Self::build(false, PublishBehavior::Faithful))
         }
         fn failing() -> Arc<Self> {
-            Arc::new(Self {
-                put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
-                put_stream_keys: tokio::sync::Mutex::new(Vec::new()),
-                copies: tokio::sync::Mutex::new(Vec::new()),
-                metadata_writes: tokio::sync::Mutex::new(Vec::new()),
-                deletes: tokio::sync::Mutex::new(Vec::new()),
-                put_stream_fails: true,
-                copy_fails: false,
-                object_written: std::sync::atomic::AtomicBool::new(false),
-            })
+            Arc::new(Self::build(true, PublishBehavior::Faithful))
         }
         /// `put_stream` succeeds but `copy` (the publish step) always fails.
         fn copy_failing() -> Arc<Self> {
+            Arc::new(Self::build(false, PublishBehavior::Fails))
+        }
+        /// #4630: `put_stream` and `copy` both report success, but the publish
+        /// leaves the live key empty.
+        fn publish_lands_empty() -> Arc<Self> {
+            Arc::new(Self::build(false, PublishBehavior::LandsEmpty))
+        }
+        /// #4630: as [`Self::publish_lands_empty`] but the live key is left
+        /// holding `landed` bytes instead of none.
+        fn publish_lands_truncated(landed: u64) -> Arc<Self> {
+            Arc::new(Self::build(false, PublishBehavior::LandsTruncated(landed)))
+        }
+        /// #4630: the publish succeeds but the live key cannot be measured
+        /// afterwards, so `etag` is the only evidence the writer has about it.
+        fn publish_unmeasurable(etag: Option<&str>) -> Arc<Self> {
             Arc::new(Self {
-                put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
-                put_stream_keys: tokio::sync::Mutex::new(Vec::new()),
-                copies: tokio::sync::Mutex::new(Vec::new()),
-                metadata_writes: tokio::sync::Mutex::new(Vec::new()),
-                deletes: tokio::sync::Mutex::new(Vec::new()),
-                put_stream_fails: false,
-                copy_fails: true,
-                object_written: std::sync::atomic::AtomicBool::new(false),
+                etag: etag.map(str::to_string),
+                ..Self::build(false, PublishBehavior::Unmeasurable)
             })
         }
     }
@@ -12118,13 +12519,55 @@ mod tests {
                 .lock()
                 .await
                 .push((src.to_string(), dst.to_string()));
-            if self.copy_fails {
-                return Err(AppError::Storage("simulated copy failure".to_string()));
-            }
+            // A real publish leaves the live key holding the staged bytes; the
+            // #4630 doubles leave it empty or short while still reporting
+            // success.
+            let staged = self
+                .put_stream_totals
+                .lock()
+                .await
+                .get(src)
+                .copied()
+                .unwrap_or(0);
+            let landed = match self.publish {
+                PublishBehavior::Fails => {
+                    return Err(AppError::Storage("simulated copy failure".to_string()));
+                }
+                PublishBehavior::Faithful | PublishBehavior::Unmeasurable => staged,
+                PublishBehavior::LandsEmpty => 0,
+                PublishBehavior::LandsTruncated(landed) => landed,
+            };
+            self.published_size
+                .store(landed, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
-        async fn size(&self, _key: &str) -> Result<u64> {
-            Ok(0)
+        async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
+            Ok(self.etag.clone())
+        }
+        /// Key-aware on purpose (#4630). The staging object still holds the
+        /// staged bytes when the publish is measured, so a guard that measured
+        /// the STAGING key instead of the live one would see the two agree and
+        /// wave a bad publish straight through. A stub that ignored its `key`
+        /// argument would let that mistake pass this suite.
+        async fn size(&self, key: &str) -> Result<u64> {
+            self.size_keys.lock().await.push(key.to_string());
+            if key.starts_with(TEE_STAGING_KEY_PREFIX) {
+                return Ok(self
+                    .put_stream_totals
+                    .lock()
+                    .await
+                    .get(key)
+                    .copied()
+                    .unwrap_or(0));
+            }
+            if matches!(self.publish, PublishBehavior::Unmeasurable) {
+                return Err(AppError::Storage(
+                    "simulated HEAD failure on the live key".to_string(),
+                ));
+            }
+            Ok(self
+                .published_size
+                .load(std::sync::atomic::Ordering::SeqCst))
         }
         async fn put_stream(
             &self,
@@ -12148,6 +12591,10 @@ mod tests {
             }
             self.object_written
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.put_stream_totals
+                .lock()
+                .await
+                .insert(key.to_string(), total);
             Ok(ServicePutStreamResult {
                 checksum_sha256: format!("{:x}", hasher.finalize()),
                 bytes_written: total,
@@ -12798,6 +13245,78 @@ mod tests {
         }
     }
 
+    /// #4630 read-path regression, on the reader that does NOT go through
+    /// `open_cached_stream`.
+    ///
+    /// stale-if-error opens the body itself and takes `Content-Length`
+    /// straight off the sidecar, so the guard added to `open_cached_stream`
+    /// and to `CacheStore::is_fresh` does not reach it. Without its own
+    /// check, a poisoned entry reproduces #4630 exactly -- `Content-Length:
+    /// 5594` ahead of an empty body, the connection aborted mid-response --
+    /// and does it on the one path that cannot refetch to heal itself,
+    /// because reaching it means upstream is already down.
+    ///
+    /// The sidecar here is the production one from #4630: the real tarball's
+    /// size against `d41d8cd9...`, the MD5 of zero bytes.
+    #[tokio::test]
+    async fn test_stale_if_error_refuses_a_sidecar_pinning_an_empty_object_4630() {
+        let backend = CacheObjectBackend::new();
+        // The object is PRESENT and empty, which is the whole difficulty:
+        // every absent-object path already self-heals.
+        backend
+            .put_object("proxy-cache/npm-proxy/4630-stale-poisoned/__content__", b"")
+            .await;
+        let mut poisoned = stale_positive_sidecar(5594);
+        poisoned.storage_etag = Some("\"d41d8cd98f00b204e9800998ecf8427e\"".to_string());
+        backend
+            .put_sidecar(
+                "proxy-cache/npm-proxy/4630-stale-poisoned/__cache_meta__.json",
+                &poisoned,
+            )
+            .await;
+
+        let served = serve_stale_if_error(backend, "4630-stale-poisoned").await;
+
+        match served {
+            Err(AppError::BadGateway(_)) => {}
+            Err(other) => panic!("expected the upstream error to propagate, got {other:?}"),
+            Ok(bytes) => panic!(
+                "stale-if-error served a sidecar claiming 5594 bytes over {} actual bytes; \
+                 that response is aborted mid-flight and renders as a 500 (#4630)",
+                bytes.len()
+            ),
+        }
+    }
+
+    /// Positive control for the guard above: stale-if-error must keep serving
+    /// an entry whose sidecar and object agree, including one that pins a
+    /// perfectly ordinary ETag. Without this, hard-coding the new check to
+    /// always refuse would pass.
+    #[tokio::test]
+    async fn test_stale_if_error_serves_an_entry_whose_pin_is_consistent_4630() {
+        let backend = CacheObjectBackend::new();
+        backend
+            .put_object(
+                "proxy-cache/npm-proxy/4630-stale-healthy/__content__",
+                b"STALE-BUT-REAL",
+            )
+            .await;
+        let mut healthy = stale_positive_sidecar(14);
+        healthy.storage_etag = Some("\"ac0a54faa6e8c861ec913465610119f4\"".to_string());
+        backend
+            .put_sidecar(
+                "proxy-cache/npm-proxy/4630-stale-healthy/__cache_meta__.json",
+                &healthy,
+            )
+            .await;
+
+        let served = serve_stale_if_error(backend, "4630-stale-healthy")
+            .await
+            .expect("a consistent entry is exactly what stale-if-error is for");
+
+        assert_eq!(served, b"STALE-BUT-REAL");
+    }
+
     /// Package Age Policy parity (#1770 / #2075). The fresh hit path and the
     /// `ServeStaleIfError` revalidation arm both run `check_quarantine_until`
     /// before streaming a cached body; this arm did not, so a held entry was
@@ -13177,10 +13696,340 @@ mod tests {
         assert!(deletes[0].starts_with(TEE_STAGING_KEY_PREFIX));
     }
 
+    // -----------------------------------------------------------------------
+    // #4630: a publish that reports success while landing a zero-byte object.
+    //
+    // #1365's guard classifies the STAGING write, which was good: the sidecar
+    // that reached production carried the real tarball's size (5594) and
+    // SHA-256 over an empty `__content__`, plus a `storage_etag` of
+    // `d41d8cd98f00b204e9800998ecf8427e` -- the MD5 of zero bytes, HEADed off
+    // the live key after the publish and recorded without being checked.
+    //
+    // Streaming reads then sent `Content-Length: 5594` ahead of an empty body
+    // forever: `open_cached_stream` self-healed only on `NotFound`, and the
+    // object was present. The write-path check stops new entries; the sidecar
+    // check lets the ones already on disk heal on the next request.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn etag_is_empty_object_accepts_the_bare_and_quoted_forms_4630() {
+        assert!(etag_is_empty_object("d41d8cd98f00b204e9800998ecf8427e"));
+        assert!(etag_is_empty_object("\"d41d8cd98f00b204e9800998ecf8427e\""));
+        // S3 ETags are hex; a backend that upper-cases must still be caught.
+        assert!(etag_is_empty_object("\"D41D8CD98F00B204E9800998ECF8427E\""));
+        assert!(!etag_is_empty_object(
+            "\"ac0a54faa6e8c861ec913465610119f4\""
+        ));
+        assert!(!etag_is_empty_object(""));
+    }
+
+    /// #2120's trap: a multipart ETag is an opaque per-upload value, never a
+    /// content hash. One that happens to carry the empty MD5 as its part-digest
+    /// hash is NOT an empty object, and must not be read as one.
+    #[test]
+    fn multipart_etag_is_never_read_as_an_empty_object_4630() {
+        assert!(is_multipart_etag("\"d41d8cd98f00b204e9800998ecf8427e-3\""));
+        assert!(!etag_is_empty_object(
+            "\"d41d8cd98f00b204e9800998ecf8427e-3\""
+        ));
+        assert!(!sidecar_pins_empty_object(
+            5594,
+            Some("\"d41d8cd98f00b204e9800998ecf8427e-3\"")
+        ));
+    }
+
+    /// The production sidecar, verbatim: 5594 bytes vouched for, empty-object
+    /// ETag pinned. No object of 5594 bytes has the ETag of an empty one.
+    #[test]
+    fn sidecar_pinning_an_empty_object_with_a_non_zero_size_is_contradictory_4630() {
+        assert!(sidecar_pins_empty_object(
+            5594,
+            Some("\"d41d8cd98f00b204e9800998ecf8427e\"")
+        ));
+    }
+
+    /// Negative controls. The guard must stay silent wherever there is nothing
+    /// to judge, or every filesystem and pre-#1051 entry becomes a permanent
+    /// cache miss.
+    #[test]
+    fn sidecar_without_a_contradiction_is_left_alone_4630() {
+        // Filesystem / legacy entry: no pin at all.
+        assert!(!sidecar_pins_empty_object(5594, None));
+        // A healthy sibling: the pin is the real object's MD5.
+        assert!(!sidecar_pins_empty_object(
+            5553,
+            Some("\"ac0a54faa6e8c861ec913465610119f4\"")
+        ));
+        // A genuinely empty entry is self-consistent. #1365 means one should
+        // not exist, and serving it sends `Content-Length: 0` with no body,
+        // which is a correct response rather than an aborted one.
+        assert!(!sidecar_pins_empty_object(
+            0,
+            Some("\"d41d8cd98f00b204e9800998ecf8427e\"")
+        ));
+    }
+
+    /// Drive one streaming cache write of `b"first-chunk"` — 11 bytes, which
+    /// is also the `Content-Length` the upstream declared, so the staging
+    /// write classifies as `Commit` — through `backend`, and wait for the
+    /// writer task to reach its exit. Shared by the #4630 write-path cases so
+    /// each of them is only its own assertions (jscpd). The metadata key is
+    /// unique per call: the #3335 publish registry and the metadata LRU are
+    /// both process-global.
+    async fn tee_publish_once(backend: &Arc<TeeRecordingBackend>, expect_commit: bool) -> Vec<u8> {
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-chunk"[..]]),
+            "cache-key".to_string(),
+            format!(
+                "proxy-cache/tee-4630-{}/__cache_meta__.json",
+                Uuid::new_v4()
+            ),
+            template(),
+            Some(11),
+            None,
+        );
+        let mut served = Vec::new();
+        while let Some(chunk) = client.next().await {
+            served.extend_from_slice(&chunk.unwrap());
+        }
+        wait_for_tee_writer_exit(backend, expect_commit).await;
+        served
+    }
+
+    /// Every key the writer deleted, in call order.
+    async fn tee_deletes(backend: &Arc<TeeRecordingBackend>) -> Vec<String> {
+        backend.deletes.lock().await.clone()
+    }
+
+    /// Write-path regression. The publish reports success and leaves the live
+    /// key empty; no sidecar may be written, so the next request refetches.
+    /// Before the guard this committed a sidecar with the right size and
+    /// checksum over a zero-byte body.
+    #[tokio::test]
+    async fn test_tee_publish_that_lands_an_empty_object_is_not_cached_4630() {
+        let backend = TeeRecordingBackend::publish_lands_empty();
+
+        let served = tee_publish_once(&backend, /* expect_commit = */ false).await;
+
+        assert_eq!(
+            served,
+            b"first-chunk".to_vec(),
+            "the client still gets the upstream bytes; only the cache write is abandoned"
+        );
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a sidecar must never vouch for bytes the live key does not hold (#4630)"
+        );
+        assert_eq!(
+            backend.copies.lock().await.len(),
+            1,
+            "the publish was attempted and reported OK"
+        );
+        let deletes = tee_deletes(&backend).await;
+        assert!(
+            deletes.iter().any(|k| k == "cache-key"),
+            "the empty object the publish left on the LIVE key must be dropped too: a refill \
+             leaves the previous sidecar in place, and its pin is that empty object's correct \
+             MD5, so nothing downstream can catch it (#4630). deletes={deletes:?}"
+        );
+        assert!(
+            deletes
+                .iter()
+                .any(|k| k.starts_with(TEE_STAGING_KEY_PREFIX)),
+            "the staging object must be discarded. deletes={deletes:?}"
+        );
+        assert_eq!(deletes.len(), 2, "exactly those two. deletes={deletes:?}");
+
+        // The refusal is also the only diagnostic anyone gets, so it must
+        // record what the SOURCE of the copy measured, not just the
+        // destination: 0 there points at the staging write or filer lag, the
+        // staged size points at `copy()` itself. The log field is not
+        // observable from here; the HEAD behind it is.
+        let size_keys = backend.size_keys.lock().await;
+        assert!(
+            size_keys.iter().any(|k| k == "cache-key"),
+            "the live key must be measured — that is the guard. size_keys={size_keys:?}"
+        );
+        assert!(
+            size_keys
+                .iter()
+                .any(|k| k.starts_with(TEE_STAGING_KEY_PREFIX)),
+            "and the staging key must be measured too, or the warning cannot say which side \
+             of the copy went wrong (#4630). size_keys={size_keys:?}"
+        );
+    }
+
+    /// A publish that lands *some* of the staged bytes is refused the same
+    /// way. The empty case is the one production produced; a truncated one is
+    /// the same contradiction with a different number, and unlike the empty
+    /// case no ETag pin would ever reveal it.
+    #[tokio::test]
+    async fn test_tee_publish_that_lands_a_truncated_object_is_not_cached_4630() {
+        let backend = TeeRecordingBackend::publish_lands_truncated(4);
+
+        let served = tee_publish_once(&backend, /* expect_commit = */ false).await;
+
+        assert_eq!(
+            served,
+            b"first-chunk".to_vec(),
+            "the client still gets all 11 upstream bytes"
+        );
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a sidecar claiming 11 bytes must not be written over a 4-byte object (#4630)"
+        );
+        let deletes = tee_deletes(&backend).await;
+        assert!(
+            deletes.iter().any(|k| k == "cache-key"),
+            "the truncated object must not be left on the live key. deletes={deletes:?}"
+        );
+    }
+
+    /// Positive control for the guards above: an honest publish still commits.
+    /// Without this, hard-coding the check to always reject would pass.
+    #[tokio::test]
+    async fn test_tee_publish_that_lands_the_staged_bytes_is_cached_4630() {
+        let backend = TeeRecordingBackend::ok();
+
+        tee_publish_once(&backend, /* expect_commit = */ true).await;
+
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            1,
+            "a publish that lands the staged bytes must still write its sidecar"
+        );
+        let deletes = tee_deletes(&backend).await;
+        assert!(
+            deletes
+                .iter()
+                .all(|k| k.starts_with(TEE_STAGING_KEY_PREFIX)),
+            "a good publish must never have its live key deleted. deletes={deletes:?}"
+        );
+    }
+
+    /// The size probe is best-effort, like the #1051 ETag pin beside it. A
+    /// backend that cannot answer the HEAD has not said the publish was bad,
+    /// and failing closed here would turn read-after-write lag on an
+    /// S3-compatible endpoint into "this deployment no longer caches
+    /// anything", announced by nothing louder than a `warn`.
+    #[tokio::test]
+    async fn test_tee_publish_commits_when_the_live_key_cannot_be_measured_4630() {
+        let backend = TeeRecordingBackend::publish_unmeasurable(None);
+
+        tee_publish_once(&backend, /* expect_commit = */ true).await;
+
+        assert_eq!(
+            backend.metadata_writes.lock().await.len(),
+            1,
+            "an unmeasurable live key must degrade to the pre-#4630 behaviour, not to a \
+             permanent cache bypass"
+        );
+        let deletes = tee_deletes(&backend).await;
+        assert!(
+            deletes
+                .iter()
+                .all(|k| k.starts_with(TEE_STAGING_KEY_PREFIX)),
+            "a failed HEAD is not evidence against the object; the live key must survive it. \
+             deletes={deletes:?}"
+        );
+    }
+
+    /// ...but the ETag pinned a line later is read off that same live key, so
+    /// when it is the empty-object MD5 while a non-zero body was staged, the
+    /// publish is proven bad with no extra storage call — which is what makes
+    /// the arm above safe to leave best-effort. (`size()` is what fails here;
+    /// the pin is the only evidence left.)
+    #[tokio::test]
+    async fn test_tee_publish_refuses_when_the_pin_proves_the_live_key_empty_4630() {
+        let backend =
+            TeeRecordingBackend::publish_unmeasurable(Some("\"d41d8cd98f00b204e9800998ecf8427e\""));
+
+        tee_publish_once(&backend, /* expect_commit = */ false).await;
+
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a pin that is the empty-object MD5 over 11 staged bytes must not reach a sidecar \
+             (#4630)"
+        );
+        let deletes = tee_deletes(&backend).await;
+        assert!(
+            deletes.iter().any(|k| k == "cache-key"),
+            "and the object it describes must not stay on the live key. deletes={deletes:?}"
+        );
+    }
+
+    /// Read-path regression, with the production sidecar against a live key
+    /// that really is empty. Before the guard this returned a stream handle
+    /// advertising `Content-Length: 5594` over zero bytes, which hyper aborts
+    /// mid-response and a reverse proxy renders as a 500, on every retry
+    /// forever.
+    #[tokio::test]
+    async fn test_open_cached_stream_refuses_a_sidecar_pinning_an_empty_object_4630() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4630-poisoned/__content__";
+        backend.put_object(content_key, b"").await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        let mut metadata = stale_positive_sidecar(5594);
+        metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+        metadata.storage_etag = Some("\"d41d8cd98f00b204e9800998ecf8427e\"".to_string());
+
+        let opened = proxy
+            .open_cached_stream(content_key, &metadata)
+            .await
+            .expect("the guard reports a miss, never an error");
+        assert!(
+            opened.is_none(),
+            "a sidecar that pins an empty object while claiming 5594 bytes must be a miss \
+             (#4630), so the caller refetches and the entry self-heals"
+        );
+    }
+
+    /// Positive control: the same read path still serves an entry whose sidecar
+    /// and object agree.
+    #[tokio::test]
+    async fn test_open_cached_stream_serves_a_consistent_entry_4630() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4630-healthy/__content__";
+        backend.put_object(content_key, b"real-tarball-bytes").await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        let mut metadata = stale_positive_sidecar(18);
+        metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+        metadata.storage_etag = Some("\"ac0a54faa6e8c861ec913465610119f4\"".to_string());
+
+        let opened = proxy
+            .open_cached_stream(content_key, &metadata)
+            .await
+            .expect("consistent entry opens");
+        let opened = opened.expect("a consistent entry is a hit");
+        assert_eq!(opened.content_length, Some(18));
+        assert_eq!(
+            drain_body(opened.body).await,
+            b"real-tarball-bytes".to_vec()
+        );
+    }
+
     /// Two concurrent tee_stream calls for the same cache key — one reject,
     /// one commit — must never let the rejected write touch the live key,
     /// regardless of interleaving. Every put_stream call targets a per-write
     /// staging key, never `cache_key` directly, so there's nothing to race.
+    ///
+    /// #4630 narrowed what that sentence can claim, so this records what it
+    /// still guarantees rather than leaving the two to contradict each other.
+    /// A write rejected *before* the publish — the case here, and every
+    /// reject arm #3153 was written about — still never reads, writes or
+    /// deletes the live key. One arm added since does delete it: the
+    /// post-copy measurement, which runs only after a `copy()` this writer
+    /// issued reported success on that key.
+    ///
+    /// That arm is not reached below, and not by accident: the rejecting
+    /// writer sends an empty body, so `classify_stream_write` turns it away
+    /// before `copy()` is ever called. The `deletes` assertion therefore
+    /// still holds for the reason it always did, and the test is unchanged.
+    /// What the new arm can cost a concurrent writer is bounded by
+    /// `test_a_clobbered_good_publish_costs_one_miss_not_corruption_4630`.
     #[tokio::test]
     async fn test_tee_concurrent_reject_and_commit_never_touch_live_key_directly() {
         let backend = TeeRecordingBackend::ok();
@@ -13260,6 +14109,57 @@ mod tests {
         let copies = backend.copies.lock().await;
         assert_eq!(copies.len(), 1, "only the commit publishes via copy()");
         assert_eq!(copies[0].1, "cache-key");
+    }
+
+    /// The bound on the race `discard_bad_publish` deliberately re-opens
+    /// (#4630, answering #3153's carve-out).
+    ///
+    /// #3153 declined a reactive delete-on-mismatch because it "could clobber
+    /// a concurrent writer's just-published good object". It still could:
+    /// cross-replica single-flight (#1609) is off by default, so two replicas
+    /// publishing the same cold key at once is ordinary traffic. What that
+    /// now costs is what this pins. The clobbered writer's sidecar survives,
+    /// describing a key that holds nothing, and the next read is a MISS — not
+    /// a hit advertising a `Content-Length` over an empty body, and not an
+    /// error. One extra upstream fetch, after which the entry is correct.
+    ///
+    /// Before #3147 the same mistake handed a client the corrupt bytes, which
+    /// is why the carve-out was right when it was written and why the
+    /// calculus inverted afterwards.
+    ///
+    /// Reached as an end state rather than by driving two writers:
+    /// `TeeRecordingBackend` records calls instead of modelling object state,
+    /// so a concurrent pair could only assert which calls were made, never
+    /// what a later reader is served — which is the claim that matters here.
+    #[tokio::test]
+    async fn test_a_clobbered_good_publish_costs_one_miss_not_corruption_4630() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4630-clobbered/__content__";
+
+        // Replica B published the real bytes and committed its sidecar.
+        backend.put_object(content_key, b"real-tarball-bytes").await;
+        let mut metadata = stale_positive_sidecar(18);
+        metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+        metadata.storage_etag = Some("\"ac0a54faa6e8c861ec913465610119f4\"".to_string());
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        // Replica A measured its own empty publish a moment later and
+        // dropped the live key — which by then held B's good object.
+        backend
+            .delete(content_key)
+            .await
+            .expect("the clobbering delete succeeds");
+
+        let opened = proxy
+            .open_cached_stream(content_key, &metadata)
+            .await
+            .expect("a missing object is a miss, never an error");
+
+        assert!(
+            opened.is_none(),
+            "a surviving sidecar over a deleted object must take the `NotFound` self-heal: \
+             the worst case of a wrong delete is a cache miss, not corruption (#4630 / #3153)"
+        );
     }
 
     /// The `Err` arm: an upstream error mid-stream must leave the live key
@@ -14320,6 +15220,11 @@ mod tests {
     struct TeeEtagBackend {
         inner: tokio::sync::Mutex<Vec<(String, Bytes)>>,
         etag: Option<String>,
+        /// Bytes the staging `put_stream` recorded, which `copy()` then
+        /// publishes onto the live key. #4630's write-path check measures the
+        /// published object, so a stub that always reported 0 here would make
+        /// every commit look like an empty publish.
+        published: std::sync::atomic::AtomicU64,
     }
 
     #[async_trait::async_trait]
@@ -14347,7 +15252,7 @@ mod tests {
             Ok(())
         }
         async fn size(&self, _k: &str) -> Result<u64> {
-            Ok(0)
+            Ok(self.published.load(std::sync::atomic::Ordering::SeqCst))
         }
         async fn put_stream(
             &self,
@@ -14363,6 +15268,8 @@ mod tests {
                 hasher.update(&chunk);
                 total += chunk.len() as u64;
             }
+            self.published
+                .store(total, std::sync::atomic::Ordering::SeqCst);
             Ok(ServicePutStreamResult {
                 checksum_sha256: format!("{:x}", hasher.finalize()),
                 bytes_written: total,
@@ -14378,6 +15285,7 @@ mod tests {
         let backend = Arc::new(TeeEtagBackend {
             inner: tokio::sync::Mutex::new(Vec::new()),
             etag: Some("\"after-put-etag\"".to_string()),
+            published: std::sync::atomic::AtomicU64::new(0),
         });
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
@@ -14410,6 +15318,7 @@ mod tests {
         let backend = Arc::new(TeeEtagBackend {
             inner: tokio::sync::Mutex::new(Vec::new()),
             etag: None,
+            published: std::sync::atomic::AtomicU64::new(0),
         });
         let storage = Arc::new(RealStorageService::new(backend.clone()));
 
